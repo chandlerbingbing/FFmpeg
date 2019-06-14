@@ -22,6 +22,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <pthread.h>
 
 #include "libavutil/avassert.h"
 #include "libavutil/avutil.h"
@@ -234,151 +235,51 @@ static void lumRangeFromJpeg16_c(int16_t *_dst, int width)
     if (DEBUG_SWSCALE_BUFFERS)                  \
         av_log(c, AV_LOG_DEBUG, __VA_ARGS__)
 
-static int swscale(SwsContext *c, const uint8_t *src[],
-                   int srcStride[], int srcSliceY,
-                   int srcSliceH, uint8_t *dst[], int dstStride[])
-{
-    /* load a few things into local vars to make the code more readable?
-     * and faster */
-    const int dstW                   = c->dstW;
-    const int dstH                   = c->dstH;
 
-    const enum AVPixelFormat dstFormat = c->dstFormat;
-    const int flags                  = c->flags;
-    int32_t *vLumFilterPos           = c->vLumFilterPos;
-    int32_t *vChrFilterPos           = c->vChrFilterPos;
+static void swscale_step(SwsContext *c)
+{
+    SwsContextStep *step = &c->step_param;
+    int dstY= step->dstY;
+    int dstHend= step->dstHend;
+    int dstH= step->dstH;
+    int srcSliceY= step->srcSliceY;
+    int srcSliceH= step->srcSliceH;
+
+    const int32_t *vLumFilterPos     = c->vLumFilterPos;
+    const int32_t *vChrFilterPos     = c->vChrFilterPos;
 
     const int vLumFilterSize         = c->vLumFilterSize;
     const int vChrFilterSize         = c->vChrFilterSize;
 
-    yuv2planar1_fn yuv2plane1        = c->yuv2plane1;
-    yuv2planarX_fn yuv2planeX        = c->yuv2planeX;
-    yuv2interleavedX_fn yuv2nv12cX   = c->yuv2nv12cX;
-    yuv2packed1_fn yuv2packed1       = c->yuv2packed1;
-    yuv2packed2_fn yuv2packed2       = c->yuv2packed2;
-    yuv2packedX_fn yuv2packedX       = c->yuv2packedX;
-    yuv2anyX_fn yuv2anyX             = c->yuv2anyX;
-    const int chrSrcSliceY           =                srcSliceY >> c->chrSrcVSubSample;
+    const int chrSrcSliceY           = srcSliceY >> c->chrSrcVSubSample;
     const int chrSrcSliceH           = AV_CEIL_RSHIFT(srcSliceH,   c->chrSrcVSubSample);
-    int should_dither                = isNBPS(c->srcFormat) ||
+    const int should_dither          = isNBPS(c->srcFormat) ||
                                        is16BPS(c->srcFormat);
-    int lastDstY;
 
     /* vars which will change and which we need to store back in the context */
-    int dstY         = c->dstY;
     int lumBufIndex  = c->lumBufIndex;
     int chrBufIndex  = c->chrBufIndex;
     int lastInLumBuf = c->lastInLumBuf;
     int lastInChrBuf = c->lastInChrBuf;
 
-
-    int lumStart = 0;
-    int lumEnd = c->descIndex[0];
-    int chrStart = lumEnd;
-    int chrEnd = c->descIndex[1];
-    int vStart = chrEnd;
-    int vEnd = c->numDesc;
-    SwsSlice *src_slice = &c->slice[lumStart];
+    const int lumStart = 0;
+    const int lumEnd = c->descIndex[0];
+    const int chrStart = lumEnd;
+    const int chrEnd = c->descIndex[1];
+    const int vStart = chrEnd;
+    const int vEnd = c->numDesc;
     SwsSlice *hout_slice = &c->slice[c->numSlice-2];
-    SwsSlice *vout_slice = &c->slice[c->numSlice-1];
     SwsFilterDescriptor *desc = c->desc;
-
-
-    int needAlpha = c->needAlpha;
 
     int hasLumHoles = 1;
     int hasChrHoles = 1;
 
+    int refreshBuff = 1;
 
-    if (isPacked(c->srcFormat)) {
-        src[0] =
-        src[1] =
-        src[2] =
-        src[3] = src[0];
-        srcStride[0] =
-        srcStride[1] =
-        srcStride[2] =
-        srcStride[3] = srcStride[0];
-    }
-    srcStride[1] <<= c->vChrDrop;
-    srcStride[2] <<= c->vChrDrop;
+    for (; dstY < dstHend; dstY++) {
 
-    DEBUG_BUFFERS("swscale() %p[%d] %p[%d] %p[%d] %p[%d] -> %p[%d] %p[%d] %p[%d] %p[%d]\n",
-                  src[0], srcStride[0], src[1], srcStride[1],
-                  src[2], srcStride[2], src[3], srcStride[3],
-                  dst[0], dstStride[0], dst[1], dstStride[1],
-                  dst[2], dstStride[2], dst[3], dstStride[3]);
-    DEBUG_BUFFERS("srcSliceY: %d srcSliceH: %d dstY: %d dstH: %d\n",
-                  srcSliceY, srcSliceH, dstY, dstH);
-    DEBUG_BUFFERS("vLumFilterSize: %d vChrFilterSize: %d\n",
-                  vLumFilterSize, vChrFilterSize);
-
-    if (dstStride[0]&15 || dstStride[1]&15 ||
-        dstStride[2]&15 || dstStride[3]&15) {
-        static int warnedAlready = 0; // FIXME maybe move this into the context
-        if (flags & SWS_PRINT_INFO && !warnedAlready) {
-            av_log(c, AV_LOG_WARNING,
-                   "Warning: dstStride is not aligned!\n"
-                   "         ->cannot do aligned memory accesses anymore\n");
-            warnedAlready = 1;
-        }
-    }
-
-    if (   (uintptr_t)dst[0]&15 || (uintptr_t)dst[1]&15 || (uintptr_t)dst[2]&15
-        || (uintptr_t)src[0]&15 || (uintptr_t)src[1]&15 || (uintptr_t)src[2]&15
-        || dstStride[0]&15 || dstStride[1]&15 || dstStride[2]&15 || dstStride[3]&15
-        || srcStride[0]&15 || srcStride[1]&15 || srcStride[2]&15 || srcStride[3]&15
-    ) {
-        static int warnedAlready=0;
-        int cpu_flags = av_get_cpu_flags();
-        if (HAVE_MMXEXT && (cpu_flags & AV_CPU_FLAG_SSE2) && !warnedAlready){
-            av_log(c, AV_LOG_WARNING, "Warning: data is not aligned! This can lead to a speed loss\n");
-            warnedAlready=1;
-        }
-    }
-
-    /* Note the user might start scaling the picture in the middle so this
-     * will not get executed. This is not really intended but works
-     * currently, so people might do it. */
-    if (srcSliceY == 0) {
-        lumBufIndex  = -1;
-        chrBufIndex  = -1;
-        dstY         = 0;
-        lastInLumBuf = -1;
-        lastInChrBuf = -1;
-    }
-
-    if (!should_dither) {
-        c->chrDither8 = c->lumDither8 = sws_pb_64;
-    }
-    lastDstY = dstY;
-
-    ff_init_vscale_pfn(c, yuv2plane1, yuv2planeX, yuv2nv12cX,
-                   yuv2packed1, yuv2packed2, yuv2packedX, yuv2anyX, c->use_mmx_vfilter);
-
-    ff_init_slice_from_src(src_slice, (uint8_t**)src, srcStride, c->srcW,
-            srcSliceY, srcSliceH, chrSrcSliceY, chrSrcSliceH, 1);
-
-    ff_init_slice_from_src(vout_slice, (uint8_t**)dst, dstStride, c->dstW,
-            dstY, dstH, dstY >> c->chrDstVSubSample,
-            AV_CEIL_RSHIFT(dstH, c->chrDstVSubSample), 0);
-    if (srcSliceY == 0) {
-        hout_slice->plane[0].sliceY = lastInLumBuf + 1;
-        hout_slice->plane[1].sliceY = lastInChrBuf + 1;
-        hout_slice->plane[2].sliceY = lastInChrBuf + 1;
-        hout_slice->plane[3].sliceY = lastInLumBuf + 1;
-
-        hout_slice->plane[0].sliceH =
-        hout_slice->plane[1].sliceH =
-        hout_slice->plane[2].sliceH =
-        hout_slice->plane[3].sliceH = 0;
-        hout_slice->width = dstW;
-    }
-
-    for (; dstY < dstH; dstY++) {
         const int chrDstY = dstY >> c->chrDstVSubSample;
         int use_mmx_vfilter= c->use_mmx_vfilter;
-
         // First line needed as input
         const int firstLumSrcY  = FFMAX(1 - vLumFilterSize, vLumFilterPos[dstY]);
         const int firstLumSrcY2 = FFMAX(1 - vLumFilterSize, vLumFilterPos[FFMIN(dstY | ((1 << c->chrDstVSubSample) - 1), dstH - 1)]);
@@ -395,9 +296,10 @@ static int swscale(SwsContext *c, const uint8_t *src[],
         int posY, cPosY, firstPosY, lastPosY, firstCPosY, lastCPosY;
 
         // handle holes (FAST_BILINEAR & weird filters)
-        if (firstLumSrcY > lastInLumBuf) {
+        if (refreshBuff || firstLumSrcY > lastInLumBuf) {
 
             hasLumHoles = lastInLumBuf != firstLumSrcY - 1;
+
             if (hasLumHoles) {
                 hout_slice->plane[0].sliceY = firstLumSrcY;
                 hout_slice->plane[3].sliceY = firstLumSrcY;
@@ -407,9 +309,10 @@ static int swscale(SwsContext *c, const uint8_t *src[],
 
             lastInLumBuf = firstLumSrcY - 1;
         }
-        if (firstChrSrcY > lastInChrBuf) {
+        if (refreshBuff || firstChrSrcY > lastInChrBuf) {
 
             hasChrHoles = lastInChrBuf != firstChrSrcY - 1;
+
             if (hasChrHoles) {
                 hout_slice->plane[1].sliceY = firstChrSrcY;
                 hout_slice->plane[2].sliceY = firstChrSrcY;
@@ -419,6 +322,8 @@ static int swscale(SwsContext *c, const uint8_t *src[],
 
             lastInChrBuf = firstChrSrcY - 1;
         }
+
+        refreshBuff = 0;
 
         DEBUG_BUFFERS("dstY: %d\n", dstY);
         DEBUG_BUFFERS("\tfirstLumSrcY: %d lastLumSrcY: %d lastInLumBuf: %d\n",
@@ -440,8 +345,8 @@ static int swscale(SwsContext *c, const uint8_t *src[],
         av_assert0((lastLumSrcY - firstLumSrcY + 1) <= hout_slice->plane[0].available_lines);
         av_assert0((lastChrSrcY - firstChrSrcY + 1) <= hout_slice->plane[1].available_lines);
 
-
         posY = hout_slice->plane[0].sliceY + hout_slice->plane[0].sliceH;
+
         if (posY <= lastLumSrcY && !hasLumHoles) {
             firstPosY = FFMAX(firstLumSrcY, posY);
             lastPosY = FFMIN(firstLumSrcY + hout_slice->plane[0].available_lines - 1, srcSliceY + srcSliceH - 1);
@@ -496,11 +401,21 @@ static int swscale(SwsContext *c, const uint8_t *src[],
         if (dstY >= dstH - 2) {
             /* hmm looks like we can't use MMX here without overwriting
              * this array's tail */
+
+            yuv2planar1_fn yuv2plane1        = c->yuv2plane1;
+            yuv2planarX_fn yuv2planeX        = c->yuv2planeX;
+            yuv2interleavedX_fn yuv2nv12cX   = c->yuv2nv12cX;
+            yuv2packed1_fn yuv2packed1       = c->yuv2packed1;
+            yuv2packed2_fn yuv2packed2       = c->yuv2packed2;
+            yuv2packedX_fn yuv2packedX       = c->yuv2packedX;
+            yuv2anyX_fn yuv2anyX             = c->yuv2anyX;
+
             ff_sws_init_output_funcs(c, &yuv2plane1, &yuv2planeX, &yuv2nv12cX,
                                      &yuv2packed1, &yuv2packed2, &yuv2packedX, &yuv2anyX);
             use_mmx_vfilter= 0;
             ff_init_vscale_pfn(c, yuv2plane1, yuv2planeX, yuv2nv12cX,
                            yuv2packed1, yuv2packed2, yuv2packedX, yuv2anyX, use_mmx_vfilter);
+
         }
 
         {
@@ -508,6 +423,254 @@ static int swscale(SwsContext *c, const uint8_t *src[],
                 desc[i].process(c, &desc[i], dstY, 1);
         }
     }
+
+    /* store changed local vars back in the context */
+    c->dstY         = dstY;
+    c->lumBufIndex  = lumBufIndex;
+    c->chrBufIndex  = chrBufIndex;
+    c->lastInLumBuf = lastInLumBuf;
+    c->lastInChrBuf = lastInChrBuf;
+}
+
+#if HAVE_THREADS
+static int swscale_threads_prepare(SwsContext *c)
+{
+    int i;
+
+    if (c->is_threads_prepared) {
+        return 0;
+    }
+    c->is_threads_prepared = 1;
+
+    if (!c->threads_ctx) return 0;
+
+    for (i = 0; i < c->sw_nbthreads ; ++i) {
+        struct SwsContextThread *ctx = &c->threads_ctx[i];
+        SwsContext *copy_ctx = sws_alloc_context();
+
+        ctx->func_pfn = swscale_step;
+        ctx->func_ctx = copy_ctx;
+        memcpy(copy_ctx, c ,sizeof(SwsContext));
+        copy_ctx->parent = c;
+        ff_init_filters(copy_ctx);
+    }
+
+    return 0;
+}
+#endif
+
+
+static int swscale(SwsContext *c, const uint8_t *src[],
+                   int srcStride[], int srcSliceY,
+                   int srcSliceH, uint8_t *dst[], int dstStride[])
+{
+    /* load a few things into local vars to make the code more readable?
+     * and faster */
+    const int dstW                   = c->dstW;
+    const int dstH                   = c->dstH;
+
+    const enum AVPixelFormat dstFormat = c->dstFormat;
+    const int flags                  = c->flags;
+
+    const int vLumFilterSize         = c->vLumFilterSize;
+    const int vChrFilterSize         = c->vChrFilterSize;
+
+    yuv2planar1_fn yuv2plane1        = c->yuv2plane1;
+    yuv2planarX_fn yuv2planeX        = c->yuv2planeX;
+    yuv2interleavedX_fn yuv2nv12cX   = c->yuv2nv12cX;
+    yuv2packed1_fn yuv2packed1       = c->yuv2packed1;
+    yuv2packed2_fn yuv2packed2       = c->yuv2packed2;
+    yuv2packedX_fn yuv2packedX       = c->yuv2packedX;
+    yuv2anyX_fn yuv2anyX             = c->yuv2anyX;
+    const int chrSrcSliceY           =                srcSliceY >> c->chrSrcVSubSample;
+    const int chrSrcSliceH           = AV_CEIL_RSHIFT(srcSliceH,   c->chrSrcVSubSample);
+    int should_dither                = isNBPS(c->srcFormat) ||
+                                       is16BPS(c->srcFormat);
+    int lastDstY;
+
+    /* vars which will change and which we need to store back in the context */
+    int dstY         = c->dstY;
+    int lastInLumBuf = c->lastInLumBuf;
+    int lastInChrBuf = c->lastInChrBuf;
+
+
+    int lumStart = 0;
+
+    SwsSlice *src_slice = &c->slice[lumStart];
+    SwsSlice *hout_slice = &c->slice[c->numSlice-2];
+    SwsSlice *vout_slice = &c->slice[c->numSlice-1];
+
+    int needAlpha = c->needAlpha;
+    SwsContextStep *step;
+    int last_chunk;
+
+#if HAVE_THREADS
+    int nbthreads = c->sw_nbthreads;
+    int left_lines;
+    int lines_per_thread = 0;
+    struct SwsContextThread *ctx;
+#endif
+
+    if (isPacked(c->srcFormat)) {
+        src[0] =
+        src[1] =
+        src[2] =
+        src[3] = src[0];
+        srcStride[0] =
+        srcStride[1] =
+        srcStride[2] =
+        srcStride[3] = srcStride[0];
+    }
+    srcStride[1] <<= c->vChrDrop;
+    srcStride[2] <<= c->vChrDrop;
+
+    DEBUG_BUFFERS("swscale() %p[%d] %p[%d] %p[%d] %p[%d] -> %p[%d] %p[%d] %p[%d] %p[%d]\n",
+                  src[0], srcStride[0], src[1], srcStride[1],
+                  src[2], srcStride[2], src[3], srcStride[3],
+                  dst[0], dstStride[0], dst[1], dstStride[1],
+                  dst[2], dstStride[2], dst[3], dstStride[3]);
+    DEBUG_BUFFERS("srcSliceY: %d srcSliceH: %d dstY: %d dstH: %d\n",
+                  srcSliceY, srcSliceH, dstY, dstH);
+    DEBUG_BUFFERS("vLumFilterSize: %d vChrFilterSize: %d\n",
+                  vLumFilterSize, vChrFilterSize);
+
+    if (dstStride[0]&15 || dstStride[1]&15 ||
+        dstStride[2]&15 || dstStride[3]&15) {
+        static int warnedAlready = 0; // FIXME maybe move this into the context
+        if (flags & SWS_PRINT_INFO && !warnedAlready) {
+            av_log(c, AV_LOG_WARNING,
+                   "Warning: dstStride is not aligned!\n"
+                   "         ->cannot do aligned memory accesses anymore\n");
+            warnedAlready = 1;
+        }
+    }
+
+    if (   (uintptr_t)dst[0]&15 || (uintptr_t)dst[1]&15 || (uintptr_t)dst[2]&15
+        || (uintptr_t)src[0]&15 || (uintptr_t)src[1]&15 || (uintptr_t)src[2]&15
+        || dstStride[0]&15 || dstStride[1]&15 || dstStride[2]&15 || dstStride[3]&15
+        || srcStride[0]&15 || srcStride[1]&15 || srcStride[2]&15 || srcStride[3]&15
+    ) {
+        static int warnedAlready=0;
+        int cpu_flags = av_get_cpu_flags();
+        if (HAVE_MMXEXT && (cpu_flags & AV_CPU_FLAG_SSE2) && !warnedAlready){
+            av_log(c, AV_LOG_WARNING, "Warning: data is not aligned! This can lead to a speed loss\n");
+            warnedAlready=1;
+        }
+    }
+
+    /* Note the user might start scaling the picture in the middle so this
+     * will not get executed. This is not really intended but works
+     * currently, so people might do it. */
+    if (srcSliceY == 0) {
+        dstY         = 0;
+        lastInLumBuf = -1;
+        lastInChrBuf = -1;
+    }
+
+    if (!should_dither) {
+        c->chrDither8 = c->lumDither8 = sws_pb_64;
+    }
+    lastDstY = dstY;
+
+    ff_init_vscale_pfn(c, yuv2plane1, yuv2planeX, yuv2nv12cX,
+                   yuv2packed1, yuv2packed2, yuv2packedX, yuv2anyX, c->use_mmx_vfilter);
+
+    ff_init_slice_from_src(src_slice, (uint8_t**)src, srcStride, c->srcW,
+            srcSliceY, srcSliceH, chrSrcSliceY, chrSrcSliceH, 1);
+
+    ff_init_slice_from_src(vout_slice, (uint8_t**)dst, dstStride, c->dstW,
+            dstY, dstH, dstY >> c->chrDstVSubSample,
+            AV_CEIL_RSHIFT(dstH, c->chrDstVSubSample), 0);
+    if (srcSliceY == 0) {
+        hout_slice->plane[0].sliceY = lastInLumBuf + 1;
+        hout_slice->plane[1].sliceY = lastInChrBuf + 1;
+        hout_slice->plane[2].sliceY = lastInChrBuf + 1;
+        hout_slice->plane[3].sliceY = lastInLumBuf + 1;
+
+        hout_slice->plane[0].sliceH =
+        hout_slice->plane[1].sliceH =
+        hout_slice->plane[2].sliceH =
+        hout_slice->plane[3].sliceH = 0;
+        hout_slice->width = dstW;
+    }
+
+    last_chunk = dstH - dstY;
+
+#if HAVE_THREADS
+    left_lines = last_chunk;
+
+    if (nbthreads > 1 && c->threads_ctx) {
+        int slice_round = 64;
+
+        /* Calculate two last lines at the end of threads. */
+        last_chunk = 2;
+        left_lines = left_lines - last_chunk;
+        lines_per_thread = (left_lines + nbthreads -1)/nbthreads;
+
+        if (lines_per_thread < slice_round)
+            lines_per_thread = slice_round;
+        else if (lines_per_thread & (slice_round - 1))
+            lines_per_thread += slice_round - (lines_per_thread & (slice_round - 1));
+
+        if (lines_per_thread > left_lines)
+            lines_per_thread =  left_lines;
+
+        nbthreads = (left_lines + lines_per_thread -1)/lines_per_thread;
+    } else {
+        nbthreads = 0;
+    }
+
+    swscale_threads_prepare(c);
+
+    for (int s = 0; s < nbthreads; s++) {
+        int chunk = lines_per_thread;
+        if (chunk > left_lines) {
+            chunk = left_lines;
+            /* Use current thread to calc last part. */
+            last_chunk += left_lines;
+            break;
+        }
+
+        left_lines -= chunk;
+        if (chunk <= 0)
+            break;
+
+        ctx = &c->threads_ctx[s];
+        step = &ctx->func_ctx->step_param;
+
+        step->dstY= dstY + s * lines_per_thread;
+        step->dstHend = dstY + s * lines_per_thread + chunk;
+        step->dstH = dstH;
+        step->srcSliceY = srcSliceY;
+        step->srcSliceH = srcSliceH;
+
+        pthread_mutex_lock(&ctx->process_mutex);
+        ctx->t_work = 1;
+        pthread_cond_signal(&ctx->process_cond);
+        pthread_mutex_unlock(&ctx->process_mutex);
+   }
+
+#endif
+
+   /*
+    * Calculate last /all lines in slice at the end
+    * to actualize original SwsContext structure.
+    */
+    step = &c->step_param;
+    step->dstY= dstH - last_chunk;
+    step->dstHend = dstH;
+    step->dstH = dstH;
+    step->srcSliceY = srcSliceY;
+    step->srcSliceH = srcSliceH;
+    swscale_step(c);
+
+    dstY = c->dstY;
+
+#if HAVE_THREADS
+    swscale_thread_wait_finish(c);
+#endif
+
+
     if (isPlanar(dstFormat) && isALPHA(dstFormat) && !needAlpha) {
         int length = dstW;
         int height = dstY - lastDstY;
@@ -526,13 +689,6 @@ static int swscale(SwsContext *c, const uint8_t *src[],
         __asm__ volatile ("sfence" ::: "memory");
 #endif
     emms_c();
-
-    /* store changed local vars back in the context */
-    c->dstY         = dstY;
-    c->lumBufIndex  = lumBufIndex;
-    c->chrBufIndex  = chrBufIndex;
-    c->lastInLumBuf = lastInLumBuf;
-    c->lastInChrBuf = lastInChrBuf;
 
     return dstY - lastDstY;
 }

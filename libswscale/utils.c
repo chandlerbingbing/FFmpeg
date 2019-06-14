@@ -27,6 +27,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <pthread.h>
 #if HAVE_MMAP
 #include <sys/mman.h>
 #if defined(MAP_ANON) && !defined(MAP_ANONYMOUS)
@@ -1156,6 +1157,114 @@ static enum AVPixelFormat alphaless_fmt(enum AVPixelFormat fmt)
     }
 }
 
+
+#if HAVE_THREADS
+static void *swscale_thread(void *arg)
+{
+	struct SwsContextThread *ctx = (struct SwsContextThread *)arg;
+
+    while(1) {
+        pthread_mutex_lock(&ctx->process_mutex);
+        while (ctx->t_work == 0 && !ctx->t_end)
+            pthread_cond_wait(&ctx->process_cond, &ctx->process_mutex);
+        pthread_mutex_unlock(&ctx->process_mutex);
+
+        if (ctx->t_end)
+            break;
+
+        ctx->func_pfn(ctx->func_ctx);
+
+        pthread_mutex_lock(&ctx->finish_mutex);
+        ctx->t_work = 0;
+        pthread_cond_signal(&ctx->finish_cond);
+        pthread_mutex_unlock(&ctx->finish_mutex);
+    }
+
+	return NULL;
+}
+
+static int swscale_thread_init(SwsContext *c)
+{
+    struct SwsContextThread *ctx;
+    int i, ret;
+
+    c->threads_ctx = av_malloc(c->sw_nbthreads * sizeof(*c->threads_ctx));
+    c->is_threads_prepared = 0;
+
+    for (i = 0; i < c->sw_nbthreads; ++i) {
+        ctx = &c->threads_ctx[i];
+        ctx->t_work = 0;
+        ctx->t_end = 0;
+
+        pthread_mutex_init(&ctx->process_mutex, NULL);
+        pthread_mutex_init(&ctx->finish_mutex, NULL);
+        pthread_cond_init(&ctx->process_cond, NULL);
+        pthread_cond_init(&ctx->finish_cond, NULL);
+
+        if ((ret = pthread_create(&c->threads_ctx[i].f_thread, NULL, swscale_thread, &c->threads_ctx[i]))) {
+            return AVERROR(ret);
+        }
+    }
+    return 0;
+}
+
+static void swscale_thread_deinit(SwsContext *c)
+{
+    struct SwsContextThread *ctx;
+    SwsContext *context;
+    int i;
+
+    if (!c->threads_ctx)
+        return;
+
+    for (i = 0; i < c->sw_nbthreads; ++i) {
+        ctx = &c->threads_ctx[i];
+        pthread_mutex_lock(&ctx->process_mutex);
+        ctx->t_end = 1;
+        pthread_cond_signal(&ctx->process_cond);
+        pthread_mutex_unlock(&ctx->process_mutex);
+    }
+
+    for (i = 0; i < c->sw_nbthreads; ++i) {
+        pthread_join(c->threads_ctx[i].f_thread, NULL);
+    }
+
+    for (i = 0; i < c->sw_nbthreads; ++i) {
+        ctx = &c->threads_ctx[i];
+        pthread_mutex_destroy(&ctx->process_mutex);
+        pthread_mutex_destroy(&ctx->finish_mutex);
+        pthread_cond_destroy(&ctx->process_cond);
+        pthread_cond_destroy(&ctx->finish_cond);
+        context = ctx->func_ctx;
+        if(context){
+            ff_free_filters(context);
+            av_free(context);
+            ctx->func_ctx = NULL;
+        }
+    }
+
+    av_free(c->threads_ctx);
+    c->threads_ctx = NULL;
+}
+
+void swscale_thread_wait_finish(SwsContext *c)
+{
+    int i;
+    if (!c->sw_nbthreads)
+        return;
+
+    for (i = 0; i < c->sw_nbthreads; i++) {
+        struct SwsContextThread *ctx = &c->threads_ctx[i];
+        pthread_mutex_lock(&ctx->finish_mutex);
+        while(ctx->t_work != 0)
+            pthread_cond_wait(&ctx->finish_cond, &ctx->finish_mutex);
+        pthread_mutex_unlock(&ctx->finish_mutex);
+    }
+}
+
+#endif
+
+
 av_cold int sws_init_context(SwsContext *c, SwsFilter *srcFilter,
                              SwsFilter *dstFilter)
 {
@@ -1823,7 +1932,14 @@ av_cold int sws_init_context(SwsContext *c, SwsFilter *srcFilter,
     }
 
     c->swscale = ff_getSwsFunc(c);
-    return ff_init_filters(c);
+
+    ret = ff_init_filters(c);
+
+#if HAVE_THREADS
+    swscale_thread_init(c);
+#endif
+
+    return ret;
 fail: // FIXME replace things by appropriate error codes
     if (ret == RETCODE_USE_CASCADE)  {
         int tmpW = sqrt(srcW * (int64_t)dstW);
@@ -2307,6 +2423,10 @@ void sws_freeContext(SwsContext *c)
     int i;
     if (!c)
         return;
+
+#if HAVE_THREADS
+    swscale_thread_deinit(c);
+#endif
 
     for (i = 0; i < 4; i++)
         av_freep(&c->dither_error[i]);

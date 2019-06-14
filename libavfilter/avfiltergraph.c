@@ -257,6 +257,10 @@ static int graph_config_links(AVFilterGraph *graph, AVClass *log_ctx)
     for (i = 0; i < graph->nb_filters; i++) {
         filt = graph->filters[i];
 
+#if HAVE_THREADS
+        filt->sws_slice_nbthreads = graph->sws_nbthreads;
+#endif
+
         if (!filt->nb_outputs) {
             if ((ret = avfilter_config_links(filt)))
                 return ret;

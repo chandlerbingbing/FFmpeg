@@ -1017,6 +1017,9 @@ int configure_filtergraph(FilterGraph *fg)
         AVDictionaryEntry *e = NULL;
 
         fg->graph->nb_threads = filter_nbthreads;
+#if HAVE_THREADS
+        fg->graph->sws_nbthreads = filter_scale_nbthreads;
+#endif
 
         args[0] = 0;
         while ((e = av_dict_get(ost->sws_dict, "", e,

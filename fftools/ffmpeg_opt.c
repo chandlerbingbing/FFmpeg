@@ -109,6 +109,9 @@ int frame_bits_per_raw_sample = 0;
 float max_error_rate  = 2.0/3;
 int filter_nbthreads = 0;
 int filter_complex_nbthreads = 0;
+#if HAVE_THREADS
+int filter_scale_nbthreads      = 0;
+#endif
 int vstats_version = 2;
 int abr_pipeline      = 0;
 
@@ -3498,6 +3501,10 @@ const OptionDef options[] = {
     { "disposition",    OPT_STRING | HAS_ARG | OPT_SPEC |
                         OPT_OUTPUT,                                  { .off = OFFSET(disposition) },
         "disposition", "" },
+#if HAVE_THREADS
+    { "filter_scale_threads",  HAS_ARG | OPT_INT,                          { &filter_scale_nbthreads },
+        "number of threads for scale filter" },
+#endif
     { "thread_queue_size", HAS_ARG | OPT_INT | OPT_OFFSET | OPT_EXPERT | OPT_INPUT,
                                                                      { .off = OFFSET(thread_queue_size) },
         "set the maximum number of queued packets from the demuxer" },

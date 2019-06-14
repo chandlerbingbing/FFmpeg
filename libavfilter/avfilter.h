@@ -422,6 +422,16 @@ struct AVFilterContext {
      * configured.
      */
     int extra_hw_frames;
+
+
+#if HAVE_THREADS
+    /**
+     * Number of threads to processing scale
+     */
+    int sws_slice_nbthreads;
+
+#endif
+
 };
 
 /**
@@ -907,6 +917,14 @@ typedef struct AVFilterGraph {
     int sink_links_count;
 
     unsigned disable_auto_convert;
+
+#if HAVE_THREADS
+    /**
+     * Number of threads to processing scale
+     */
+    int sws_nbthreads;
+#endif
+
 } AVFilterGraph;
 
 /**

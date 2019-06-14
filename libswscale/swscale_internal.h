@@ -275,6 +275,17 @@ typedef void (*yuv2anyX_fn)(struct SwsContext *c, const int16_t *lumFilter,
 
 struct SwsSlice;
 struct SwsFilterDescriptor;
+#if HAVE_THREADS
+struct SwsContextThread;
+#endif
+
+typedef struct  SwsContextStep {
+    int dstY;
+    int dstHend;
+    int dstH;
+    int srcSliceY;
+    int srcSliceH;
+} SwsContextStep;
 
 /* This struct should be aligned on at least a 32-byte boundary. */
 typedef struct SwsContext {
@@ -625,8 +636,43 @@ typedef struct SwsContext {
     SwsDither dither;
 
     SwsAlphaBlend alphablend;
+
+    /*
+     * Parent set if work on copy of SwsContext for multithreading.
+     */
+    struct SwsContext *parent;
+
+    /*
+     * Temporary variable to processing swscale_step().
+     */
+    SwsContextStep step_param;
+
+#if HAVE_THREADS
+    int is_threads_prepared;
+    int sw_nbthreads; //Number of threads to processing scale
+    struct SwsContextThread *threads_ctx;
+
+#endif
+
 } SwsContext;
 //FIXME check init (where 0)
+
+#if HAVE_THREADS
+struct SwsContextThread {
+    void (*func_pfn)(SwsContext *c);
+    SwsContext *func_ctx;
+
+    pthread_t f_thread;
+    pthread_cond_t process_cond;
+    pthread_cond_t finish_cond;
+    pthread_mutex_t process_mutex;
+    pthread_mutex_t finish_mutex;
+    int t_work;
+    int t_end;
+};
+
+void swscale_thread_wait_finish(struct SwsContext *c);
+#endif
 
 SwsFunc ff_yuv2rgb_get_func_ptr(SwsContext *c);
 int ff_yuv2rgb_c_init_tables(SwsContext *c, const int inv_table[4],

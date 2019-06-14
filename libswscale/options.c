@@ -80,6 +80,9 @@ static const AVOption swscale_options[] = {
     { "none",            "ignore alpha",                  0,                 AV_OPT_TYPE_CONST,  { .i64  = SWS_ALPHA_BLEND_NONE}, INT_MIN, INT_MAX,       VE, "alphablend" },
     { "uniform_color",   "blend onto a uniform color",    0,                 AV_OPT_TYPE_CONST,  { .i64  = SWS_ALPHA_BLEND_UNIFORM},INT_MIN, INT_MAX,     VE, "alphablend" },
     { "checkerboard",    "blend onto a checkerboard",     0,                 AV_OPT_TYPE_CONST,  { .i64  = SWS_ALPHA_BLEND_CHECKERBOARD},INT_MIN, INT_MAX,     VE, "alphablend" },
+#if HAVE_THREADS
+    { "sw_nbthreads",    "Threads number for scaling",     OFFSET(sw_nbthreads),      AV_OPT_TYPE_INT,    { .i64 = 0                 }, 0,       128,        VE },
+#endif
 
     { NULL }
 };

@@ -621,6 +621,7 @@ extern int abr_pipeline;
 
 extern int filter_nbthreads;
 extern int filter_complex_nbthreads;
+extern int filter_scale_nbthreads;
 extern int vstats_version;
 
 extern const AVIOInterruptCB int_cb;
