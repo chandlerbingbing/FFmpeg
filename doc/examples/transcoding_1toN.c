@@ -48,14 +48,16 @@ typedef struct StreamContext {
     AVCodecContext *dec_ctx;
     AVCodecContext *enc_ctx;
 } StreamContext;
-//static StreamContext *stream_ctx;
+static StreamContext *stream_ctx;
 
 static AVCodecContext **dec_ctxs;
 static AVCodecContext **enc_ctxs;
 
 const int nb_multi_output = 4;
-const int width[] = {7680, 1920, 1280, 480};
-const int height[] = {3840, 1080, 720, 360};
+const int width[] = {1920, 1920, 1920, 1920};
+const int height[] = {1080, 1080, 1080, 1080};
+//const int width[] = {7680, 1920, 1280, 480};
+//const int height[] = {3840, 1080, 720, 360};
 const char *output_filename[4]={"o1.mp4","o2.mp4","o3.mp4","o4.mp4"};
 
 static int open_input_file(const char *filename)
@@ -432,6 +434,8 @@ static int encode_write_frame(AVFrame *filt_frame, unsigned int i, int *got_fram
     av_init_packet(&enc_pkt);
     ret = enc_func(enc_ctxs[i * nb_multi_output + j], &enc_pkt,
             filt_frame, got_frame);
+    if(filt_frame)
+        av_log(NULL, AV_LOG_INFO, "Encoding frame pts is %ld , dts is %ld\n", filt_frame->pkt_pts,filt_frame->pkt_dts);
     av_frame_free(&filt_frame);
     if (ret < 0)
         return ret;
@@ -457,7 +461,9 @@ static int filter_encode_write_frame(AVFrame *frame, unsigned int i, int count_f
     int filter_id;
     unsigned int j;
 
-    av_log(NULL, AV_LOG_INFO, "\n\n %d:Pushing decoded frame to filters \n",count_frame);
+    //av_log(NULL, AV_LOG_INFO, "\n\n %d:Pushing decoded frame to filters \n",count_frame);
+    if(frame)
+        av_log(NULL, AV_LOG_INFO, "decoded frame pts %ld,frame dts %ld\n",frame->pkt_pts,frame->pkt_dts);
     /* push the decoded frame into the filtergraph */
     for(j = 0; j < nb_multi_output; j++){
         filter_id = i * nb_multi_output + j;
@@ -525,6 +531,7 @@ int main(int argc, char **argv)
     AVFrame *frame = NULL;
     enum AVMediaType type;
     unsigned int i;
+    int skipped_frame = 0;
     int got_frame;
     int (*dec_func)(AVCodecContext *, AVFrame *, int *, const AVPacket *);
     int count_frame = 0;
@@ -565,6 +572,9 @@ int main(int argc, char **argv)
             av_packet_rescale_ts(&packet,
                                  ifmt_ctx->streams[i]->time_base,
                                  dec_ctxs[i]->time_base);
+            //tset code
+            av_log(NULL, AV_LOG_INFO, "packet pts is %ld , dts is %ld\n",packet.pts,packet.dts);
+            //end
             dec_func = (type == AVMEDIA_TYPE_VIDEO) ? avcodec_decode_video2 :
                        avcodec_decode_audio4;
             ret = dec_func(dec_ctxs[i], frame,
@@ -583,6 +593,7 @@ int main(int argc, char **argv)
                 if (ret < 0)
                     goto end;
             } else {
+                skipped_frame++;
                 av_frame_free(&frame);
             }
 
@@ -600,7 +611,37 @@ int main(int argc, char **argv)
         }
         av_packet_unref(&packet);
     }
+    //test code
+    for(int i= skipped_frame;i>0;i--){
+        int stream_id = packet.stream_index;
+        frame = av_frame_alloc();
+        if (!frame) {
+            ret = AVERROR(ENOMEM);
+            break;
+        }
+        type = ifmt_ctx->streams[stream_id]->codecpar->codec_type;
+        dec_func = (type == AVMEDIA_TYPE_VIDEO) ? avcodec_decode_video2 :
+                   avcodec_decode_audio4;
+        ret = dec_func(dec_ctxs[stream_id], frame,
+                       &got_frame, &packet);
+        if (ret < 0) {
+            av_frame_free(&frame);
+            av_log(NULL, AV_LOG_ERROR, "Decoding failed\n");
+            break;
+        }
 
+        if (got_frame) {
+            //frame->pts = frame->best_effort_timestamp;
+            ret = filter_encode_write_frame(frame, stream_id,1);
+            av_frame_free(&frame);
+            if (ret < 0)
+                goto end;
+        } else {
+            skipped_frame++;
+            av_frame_free(&frame);
+        }
+    }
+    // end
     /* flush filters and encoders */
     for (i = 0; i < ifmt_ctx->nb_streams; i++) {
         /* flush filter */
