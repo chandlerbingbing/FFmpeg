@@ -661,13 +661,13 @@ static int flush_encoder(unsigned int i, unsigned int j)
 }
 
 
-int main(int argc, char **argv)
-{
+int main(int argc, char **argv) {
     int ret;
-    AVPacket packet = { .data = NULL, .size = 0 };
+    AVPacket packet = {.data = NULL, .size = 0};
     //AVFrame *frame = NULL;
     enum AVMediaType type;
     unsigned int i;
+    int skipped_frame = 0;
     int got_frame;
     int (*dec_func)(AVCodecContext *, AVFrame *, int *, const AVPacket *);
     FrameContext frame_ctx;
@@ -730,6 +730,7 @@ int main(int argc, char **argv)
                 if (ret < 0)
                     goto end;
             } else {
+                skipped_frame++;
                 av_frame_free(&frame_ctx.frame);
             }
 
@@ -748,6 +749,39 @@ int main(int argc, char **argv)
         av_packet_unref(&packet);
     }
 
+    /* flush decoders */
+    for (int stream_id = 0; stream_id < ifmt_ctx->nb_streams; stream_id++) {
+        for (int i = skipped_frame; i > 0; i--) {
+            frame_ctx.input_stream_index = stream_id;
+            frame_ctx.frame = av_frame_alloc();
+            if (!frame_ctx.frame) {
+                ret = AVERROR(ENOMEM);
+                break;
+            }
+            type = ifmt_ctx->streams[stream_id]->codecpar->codec_type;
+            dec_func = (type == AVMEDIA_TYPE_VIDEO) ? avcodec_decode_video2 :
+                       avcodec_decode_audio4;
+            ret = dec_func(dec_ctxs[stream_id], frame_ctx.frame,
+                           &got_frame, &packet);
+            if (ret < 0) {
+                av_frame_free(&frame_ctx.frame);
+                av_log(NULL, AV_LOG_ERROR, "Decoding failed\n");
+                break;
+            }
+
+            if (got_frame) {
+                frame_ctx.count_frame++;
+                frame_ctx.frame->pts = frame_ctx.frame->best_effort_timestamp;
+                ret = filter_encode_write_frame(&frame_ctx);
+                av_frame_free(&frame_ctx.frame);
+                if (ret < 0)
+                    goto end;
+            } else {
+                skipped_frame++;
+                av_frame_free(&frame_ctx.frame);
+            }
+        }
+    }
     /* flush filters and encoders */
     for (i = 0; i < ifmt_ctx->nb_streams; i++) {
         /* flush filter */
@@ -763,7 +797,7 @@ int main(int argc, char **argv)
         }
 
         /* flush encoder */
-        for(int j = 0; j < nb_multi_output; j++) {
+        for (int j = 0; j < nb_multi_output; j++) {
             ret = flush_encoder(i, j);
             if (ret < 0) {
                 av_log(NULL, AV_LOG_ERROR, "Flushing encoder failed\n");
@@ -772,11 +806,11 @@ int main(int argc, char **argv)
         }
     }
 
-    for(int j = 0; j < nb_multi_output; j++) {
+    for (int j = 0; j < nb_multi_output; j++) {
         av_write_trailer(ofmt_ctxs[j]);
     }
 
-end:
+    end:
     av_packet_unref(&packet);
     av_frame_free(&frame_ctx.frame);
     for (i = 0; i < ifmt_ctx->nb_streams; i++) {
