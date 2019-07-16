@@ -35,9 +35,22 @@
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
 #include <pthread.h>
+#include <string.h>
+#include <stdio.h>
 
 static AVFormatContext *ifmt_ctx;
 static AVFormatContext **ofmt_ctxs;
+
+typedef struct OptionParserContext {
+    char *enc_lib;
+    char *filter_desc;
+    char *enc_priv_data;
+    char *output_file;
+    int nb_filters;
+    int width;
+    int height;
+} OptionParserContext;
+
 typedef struct FilteringContext {
     AVFilterContext *buffersink_ctx;
     AVFilterContext *buffersrc_ctx;
@@ -57,12 +70,6 @@ typedef struct FilteringContext {
 } FilteringContext;
 static FilteringContext *filter_ctx;
 
-typedef struct StreamContext {
-    AVCodecContext *dec_ctx;
-    AVCodecContext *enc_ctx;
-} StreamContext;
-//static StreamContext *stream_ctx;
-
 typedef struct FrameContext{
     AVFrame *frame;
     unsigned int input_stream_index;
@@ -73,11 +80,8 @@ static AVCodecContext **dec_ctxs;
 static AVCodecContext **enc_ctxs;
 
 //config options
-const int nb_multi_output = 4;
-const int width[] = {7680, 1920, 1280, 480};
-const int height[] = {3840, 1080, 720, 360};
-const char *output_filename[4]={"o1.mp4","o2.mp4","o3.mp4","o4.mp4"};
-const int abr_pipeline = 1;
+static int nb_multi_output = 0;
+const int abr_pipeline = 0;
 
 static int open_input_file(const char *filename)
 {
@@ -136,7 +140,7 @@ static int open_input_file(const char *filename)
     return 0;
 }
 
-static int init_output_file(void)
+static int init_output_file(OptionParserContext *opts_ctxs)
 {
     AVStream *out_stream;
     AVStream *in_stream;
@@ -149,7 +153,7 @@ static int init_output_file(void)
 
     for(j = 0; j < nb_multi_output; j++) {
         ofmt_ctxs[j] = NULL;
-        filename = output_filename[j];
+        filename = opts_ctxs[j].output_file;
         avformat_alloc_output_context2(&ofmt_ctxs[j], NULL, NULL, filename);
         if (!ofmt_ctxs[j]) {
             av_log(NULL, AV_LOG_ERROR, "Could not create output context\n");
@@ -184,8 +188,8 @@ static int init_output_file(void)
                  * sample rate etc.). These properties can be changed for output
                  * streams easily using filters */
                 if (dec_ctx->codec_type == AVMEDIA_TYPE_VIDEO) {
-                    enc_ctx->height = height[j];
-                    enc_ctx->width = width[j];
+                    enc_ctx->height = opts_ctxs[j].height;
+                    enc_ctx->width = opts_ctxs[j].width;
                     enc_ctx->sample_aspect_ratio = dec_ctx->sample_aspect_ratio;
                     enc_ctx->pix_fmt = dec_ctx->pix_fmt;
                     /* video time_base can be set to whatever is handy and supported by encoder */
@@ -403,7 +407,7 @@ end:
     return ret;
 }
 
-static int init_filters(int nb_multi_output)
+static int init_filters(int nb_multi_output, OptionParserContext *opts_ctxs)
 {
     const char *filter_spec;
     unsigned int i,j;
@@ -427,7 +431,8 @@ static int init_filters(int nb_multi_output)
 
 
             if (ifmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
-                filter_spec = "null"; /* passthrough (dummy) filter for video */
+                //filter_spec = "null"; /* passthrough (dummy) filter for video */ //"scale=1920:1080"
+                filter_spec = opts_ctxs[j].filter_desc;
             else
                 filter_spec = "anull"; /* passthrough (dummy) filter for audio */
 
@@ -664,33 +669,81 @@ static int flush_encoder(unsigned int i, unsigned int j)
 int main(int argc, char **argv) {
     int ret;
     AVPacket packet = {.data = NULL, .size = 0};
-    //AVFrame *frame = NULL;
     enum AVMediaType type;
-    unsigned int i;
     int skipped_frame = 0;
     int got_frame;
     int (*dec_func)(AVCodecContext *, AVFrame *, int *, const AVPacket *);
     FrameContext frame_ctx;
     frame_ctx.count_frame = 0;
+    const char *input_file;
+    OptionParserContext *opts_ctxs;
 
-    if (argc != 2) {
-        av_log(NULL, AV_LOG_ERROR, "Usage: %s <input file>\n", argv[0]);
+    if (argc < 3) {
+        av_log(NULL, AV_LOG_ERROR, "Usage: %s -i <input file> \ \n "
+                                   "-nb_outputs 4 \ \n"
+                                   "-c:v libsvt_hevc -vf scale=7680:3840 -tune 1 -preset 9 -o o1.mp4 \ \n"
+                                   "-c:v libsvt_hevc -vf scale=1920:1080 -tune 1 -preset 9 -o o2.mp4 \ \n"
+                                   "-c:v libsvt_hevc -vf scale=1280:720 -tune 1 -preset 9 -o o3.mp4 \ \n"
+                                   "-c:v libsvt_hevc -vf scale=480:360 -tune 1 -preset 9 -o o4.mp4 \ \n", argv[0]);
         return 1;
     }
 
-    if ((ret = open_input_file(argv[1])) < 0)
+    if (strcmp(argv[1], "-i") == 0) {
+        input_file = argv[2];
+    } else{
+        av_log(NULL, AV_LOG_ERROR, "please provide input file. Usage: -i <input file>\n");
+        return 1;
+    }
+
+    if (strcmp(argv[3], "-nb_outputs") == 0) {
+        nb_multi_output = atoi(argv[4]);
+    } else {
+        av_log(NULL, AV_LOG_ERROR, "please provide the number of outputs. Usage: -nb_outputs 4\n");
+        return 1;
+    }
+
+    opts_ctxs = (OptionParserContext *)malloc(nb_multi_output * sizeof(OptionParserContext));
+    if (opts_ctxs == NULL) {
+        av_log(NULL, AV_LOG_ERROR, "optx_ctxs malloc failed\n");
+        return 1;
+    }
+
+    int j = 0;
+    for(int i = 1;i < argc;i=i+2) {
+        if (strcmp(argv[i], "-c:v") == 0) {
+            opts_ctxs[j].enc_lib = argv[i + 1];
+        } else if (strcmp(argv[i], "-vf") == 0) {
+            opts_ctxs[j].filter_desc = argv[i + 1];
+            char vf_arg[20];
+            strcpy(vf_arg, argv[i+1]);
+            strtok(vf_arg,"=");
+            opts_ctxs[j].width = atoi(strtok(NULL, ":"));
+            opts_ctxs[j].height = atoi(strtok(NULL, ":"));
+        } else if (strcmp(argv[i], "-tune") == 0) {
+            //TODO
+        } else if (strcmp(argv[i], "-preset") == 0) {
+            //TODO
+        } else if (strcmp(argv[i], "-o") == 0) {
+            opts_ctxs[j].output_file = argv[i + 1];
+            j++;
+        }
+    }
+
+    if ((ret = open_input_file(input_file)) < 0)
         goto end;
 
     ofmt_ctxs = av_mallocz_array(nb_multi_output, sizeof(**ofmt_ctxs));
 
-    if ((ret = init_output_file()) < 0)
+    if ((ret = init_output_file(opts_ctxs)) < 0)
         goto end;
 
-    if ((ret = init_filters(nb_multi_output)) < 0)
+    if ((ret = init_filters(nb_multi_output, opts_ctxs)) < 0)
         goto end;
 
-    /* read all packets */
+    // read all packets
     while (1) {
+        unsigned int i;
+
         if ((ret = av_read_frame(ifmt_ctx, &packet)) < 0)
             break;
 
@@ -749,7 +802,7 @@ int main(int argc, char **argv) {
         av_packet_unref(&packet);
     }
 
-    /* flush decoders */
+    // flush decoders
     for (int stream_id = 0; stream_id < ifmt_ctx->nb_streams; stream_id++) {
         for (int i = skipped_frame; i > 0; i--) {
             frame_ctx.input_stream_index = stream_id;
@@ -782,9 +835,9 @@ int main(int argc, char **argv) {
             }
         }
     }
-    /* flush filters and encoders */
-    for (i = 0; i < ifmt_ctx->nb_streams; i++) {
-        /* flush filter */
+    // flush filters and encoders
+    for (int i = 0; i < ifmt_ctx->nb_streams; i++) {
+        // flush filter
         if (!filter_ctx[i * nb_multi_output].filter_graph)
             continue;
 
@@ -796,7 +849,7 @@ int main(int argc, char **argv) {
             goto end;
         }
 
-        /* flush encoder */
+        // flush encoder
         for (int j = 0; j < nb_multi_output; j++) {
             ret = flush_encoder(i, j);
             if (ret < 0) {
@@ -811,9 +864,10 @@ int main(int argc, char **argv) {
     }
 
     end:
+    free(opts_ctxs);
     av_packet_unref(&packet);
     av_frame_free(&frame_ctx.frame);
-    for (i = 0; i < ifmt_ctx->nb_streams; i++) {
+    for (int i = 0; i < ifmt_ctx->nb_streams; i++) {
         avcodec_free_context(&dec_ctxs[i]);
         for (int j = 0; j < nb_multi_output; j++) {
             int id = i * nb_multi_output + j;
