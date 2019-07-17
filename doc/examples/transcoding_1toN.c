@@ -173,7 +173,9 @@ static int init_output_file(OptionParserContext *opts_ctxs)
             if (dec_ctx->codec_type == AVMEDIA_TYPE_VIDEO
                 || dec_ctx->codec_type == AVMEDIA_TYPE_AUDIO) {
                 /* in this example, we choose transcoding to same codec */
-                encoder = avcodec_find_encoder(dec_ctx->codec_id);
+                //encoder = avcodec_find_encoder(dec_ctx->codec_id);
+                enum AVCodecID enc_codec_id = AV_CODEC_ID_HEVC;
+                encoder = avcodec_find_encoder(enc_codec_id);
                 if (!encoder) {
                     av_log(NULL, AV_LOG_FATAL, "Necessary encoder not found\n");
                     return AVERROR_INVALIDDATA;
@@ -496,6 +498,7 @@ static void *filter_pipeline(void *arg) {
         frm = fl->waited_frm;
 
         ret = av_buffersrc_add_frame_flags(fl->buffersrc_ctx, frm, 0);
+        av_log(NULL, AV_LOG_INFO, "\n\n the thread is %d, you can put frame is %ld \n", fl->f_thread,frm->pts);
         if (ret < 0) {
             av_log(NULL, AV_LOG_ERROR, "Error while feeding the filtergraph\n");
         } else {
@@ -507,6 +510,7 @@ static void *filter_pipeline(void *arg) {
                     break;
                 }
                 ret = av_buffersink_get_frame(fl->buffersink_ctx, filt_frame);
+                av_log(NULL, AV_LOG_INFO, "\n\n the thread is %d, you can put frame is %ld \n", fl->f_thread,filt_frame->pts);
                 if (ret < 0) {
                     /* if no more frames for output - returns AVERROR(EAGAIN)
                      * if flushed and no more frames for output - returns AVERROR_EOF
