@@ -44,7 +44,7 @@ static AVFormatContext **ofmt_ctxs;
 typedef struct OptionParserContext {
     char *enc_lib;
     char *filter_desc;
-    char *enc_priv_data;
+    AVDictionary *enc_opts;
     char *output_file;
     int nb_filters;
     int width;
@@ -207,7 +207,7 @@ static int init_output_file(OptionParserContext *opts_ctxs)
                     enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
                 /* Third parameter can be used to pass settings to encoder */
-                ret = avcodec_open2(enc_ctx, encoder, NULL);
+                ret = avcodec_open2(enc_ctx, encoder, &opts_ctxs[j].enc_opts);
                 if (ret < 0) {
                     av_log(NULL, AV_LOG_ERROR, "Cannot open video encoder for stream #%u\n", i);
                     return ret;
@@ -395,6 +395,7 @@ static int init_filter(FilteringContext* fctx, AVCodecContext *dec_ctx,
     if ((ret = avfilter_graph_config(filter_graph, NULL)) < 0)
         goto end;
 
+    filter_graph->scale_sws_opts = av_strdup("flags=bicubic");
     /* Fill FilteringContext */
     fctx->buffersrc_ctx = buffersrc_ctx;
     fctx->buffersink_ctx = buffersink_ctx;
@@ -719,10 +720,16 @@ int main(int argc, char **argv) {
             strtok(vf_arg,"=");
             opts_ctxs[j].width = atoi(strtok(NULL, ":"));
             opts_ctxs[j].height = atoi(strtok(NULL, ":"));
+        } else if (strcmp(argv[i], "-rc") == 0) {
+            av_dict_set(&opts_ctxs[j].enc_opts,"rc","1", 0);
+        } else if (strcmp(argv[i], "-g") == 0) {
+            av_dict_set(&opts_ctxs[j].enc_opts,"g",argv[i+1], 0);
+        } else if (strcmp(argv[i], "-b:v") == 0) {
+            av_dict_set(&opts_ctxs[j].enc_opts,"b",argv[i+1], 0);
         } else if (strcmp(argv[i], "-tune") == 0) {
-            //TODO
+            av_dict_set(&opts_ctxs[j].enc_opts,"tune",argv[i+1], 0);
         } else if (strcmp(argv[i], "-preset") == 0) {
-            //TODO
+            av_dict_set(&opts_ctxs[j].enc_opts,"preset",argv[i+1], 0);
         } else if (strcmp(argv[i], "-o") == 0) {
             opts_ctxs[j].output_file = argv[i + 1];
             j++;
