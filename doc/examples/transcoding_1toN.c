@@ -192,6 +192,7 @@ static int init_output_file(OptionParserContext *opts_ctxs)
                     enc_ctx->width = opts_ctxs[j].width;
                     enc_ctx->sample_aspect_ratio = dec_ctx->sample_aspect_ratio;
                     enc_ctx->pix_fmt = dec_ctx->pix_fmt;
+                    enc_ctx->framerate = dec_ctx->framerate;
                     /* video time_base can be set to whatever is handy and supported by encoder */
                     enc_ctx->time_base = av_inv_q(dec_ctx->framerate);
                 } else {
@@ -219,6 +220,8 @@ static int init_output_file(OptionParserContext *opts_ctxs)
                 }
 
                 out_stream->time_base = enc_ctx->time_base;
+                out_stream->r_frame_rate = enc_ctx->framerate;
+                out_stream->codec->time_base = enc_ctx->time_base;
                 enc_ctxs[i * nb_multi_output + j] = enc_ctx;
             } else if (dec_ctx->codec_type == AVMEDIA_TYPE_UNKNOWN) {
                 av_log(NULL, AV_LOG_FATAL, "Elementary stream #%d is of unknown type, cannot proceed\n", i);
@@ -245,6 +248,9 @@ static int init_output_file(OptionParserContext *opts_ctxs)
         }
 
         /* init muxer, write output file header */
+        //AVDictionary *opt = NULL;
+        //av_dict_set_int(&opt, "video_track_timescale", 60, 0);
+        //ret = avformat_write_header(ofmt_ctxs[j], &opt);
         ret = avformat_write_header(ofmt_ctxs[j], NULL);
         if (ret < 0) {
             av_log(NULL, AV_LOG_ERROR, "Error occurred when opening output file\n");
@@ -763,7 +769,6 @@ int main(int argc, char **argv) {
         if (filter_ctx[i * nb_multi_output].filter_graph) {
 
             av_log(NULL, AV_LOG_DEBUG, "Going to reencode&filter the frame\n");
-            //frame = av_frame_alloc();
             frame_ctx.frame = av_frame_alloc();
             if (!frame_ctx.frame) {
                 ret = AVERROR(ENOMEM);
@@ -837,7 +842,6 @@ int main(int argc, char **argv) {
                 if (ret < 0)
                     goto end;
             } else {
-                skipped_frame++;
                 av_frame_free(&frame_ctx.frame);
             }
         }
