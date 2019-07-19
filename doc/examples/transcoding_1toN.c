@@ -127,7 +127,13 @@ static int open_input_file(const char *filename)
             if (codec_ctx->codec_type == AVMEDIA_TYPE_VIDEO)
                 codec_ctx->framerate = av_guess_frame_rate(ifmt_ctx, stream, NULL);
             /* Open decoder */
+#ifdef DECODE_THREAD_1
+            AVDictionary *dec_opt=NULL;
+            av_dict_set(&dec_opt,"threads","1", 0);
+            ret = avcodec_open2(codec_ctx, dec, &dec_opt);
+#endif
             ret = avcodec_open2(codec_ctx, dec, NULL);
+
             if (ret < 0) {
                 av_log(NULL, AV_LOG_ERROR, "Failed to open decoder for stream #%u\n", i);
                 return ret;
