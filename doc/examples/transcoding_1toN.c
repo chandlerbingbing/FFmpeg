@@ -85,6 +85,7 @@ static AVCodecContext **enc_ctxs;
 //config options
 static int nb_multi_output = 0;
 const int abr_pipeline = 0;
+static int64_t time_allco_s;
 
 static int open_input_file(const char *filename)
 {
@@ -474,8 +475,11 @@ static int encode_write_frame(AVFrame *filt_frame, unsigned int i, int *got_fram
     av_init_packet(&enc_pkt);
     ret = enc_func(enc_ctxs[i * nb_multi_output + j], &enc_pkt,
             filt_frame, got_frame);
-    av_frame_free(&filt_frame);
-
+    int64_t tims,timd;
+    tims = av_gettime();
+    av_frame_unref(filt_frame);
+    timd = av_gettime();
+    time_allco_s += (timd-tims);
     if (ret < 0)
         return ret;
     if (!(*got_frame))
@@ -559,6 +563,12 @@ static int filter_encode_write_frame(FrameContext *frame_ctx) {
     frame = av_frame_alloc();
     unsigned int i = frame_ctx->input_stream_index;
     int count_frame = frame_ctx->count_frame;
+    AVFrame *filt_frame;
+    int64_t tims,timd;
+    tims = av_gettime();
+    filt_frame = av_frame_alloc();
+    timd = av_gettime();
+    time_allco_s += (timd-tims);
 
     av_log(NULL, AV_LOG_INFO, "\n\n %d:Pushing decoded frame to filters \n", count_frame);
     /* push the decoded frame into the filtergraph */
@@ -583,9 +593,9 @@ static int filter_encode_write_frame(FrameContext *frame_ctx) {
             }
 
             /* pull filtered frames from the filtergraph */
-            AVFrame *filt_frame;
+
             while (1) {
-                filt_frame = av_frame_alloc();
+
                 if (!filt_frame) {
                     ret = AVERROR(ENOMEM);
                     break;
@@ -600,7 +610,7 @@ static int filter_encode_write_frame(FrameContext *frame_ctx) {
                     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
                         ret = 0;
 
-                    av_frame_free(&filt_frame);
+                    av_frame_unref(filt_frame);
                     //get_frame_default(filt_frame);
                     break;
                 }
@@ -658,6 +668,7 @@ static int filter_encode_write_frame(FrameContext *frame_ctx) {
             }
         }
     }
+    av_frame_free(&filt_frame);
     return ret;
 }
 
@@ -766,7 +777,6 @@ int main(int argc, char **argv) {
         goto end;
 
     time_b = av_gettime();
-    av_log(NULL, AV_LOG_INFO, "time begin %ld encoder\n", time_b);
     // read all packets
     while (1) {
         unsigned int i;
@@ -884,8 +894,8 @@ int main(int argc, char **argv) {
     }
     //test time code
     time_e = av_gettime();
-    av_log(NULL, AV_LOG_INFO, "time end %ld encoder\n", time_e);
-    av_log(NULL, AV_LOG_INFO, "time %ld milliseconds\n", (time_e-time_b)/1000);
+    av_log(NULL, AV_LOG_INFO, "program time %ld milliseconds\n", (time_e-time_b)/1000);
+    av_log(NULL, AV_LOG_INFO, "alloc time %ld milliseconds\n", time_allco_s/1000);
     //test end
 
     for (int j = 0; j < nb_multi_output; j++) {
