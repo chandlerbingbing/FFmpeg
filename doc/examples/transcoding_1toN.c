@@ -81,7 +81,7 @@ static AVCodecContext **enc_ctxs;
 
 //config options
 static int nb_multi_output = 0;
-const int abr_pipeline = 0;
+const int abr_pipeline = 1;
 
 static int open_input_file(const char *filename)
 {
@@ -504,7 +504,7 @@ static void *filter_pipeline(void *arg) {
         frm = fl->waited_frm;
 
         ret = av_buffersrc_add_frame_flags(fl->buffersrc_ctx, frm, 0);
-        av_log(NULL, AV_LOG_INFO, "\n\n the thread is %d, you can put frame is %ld \n", fl->f_thread,frm->pts);
+        //av_log(NULL, AV_LOG_INFO, "\n\n the thread is %d, you can put frame is %ld \n", fl->f_thread,frm->pts);
         if (ret < 0) {
             av_log(NULL, AV_LOG_ERROR, "Error while feeding the filtergraph\n");
         } else {
@@ -516,7 +516,7 @@ static void *filter_pipeline(void *arg) {
                     break;
                 }
                 ret = av_buffersink_get_frame(fl->buffersink_ctx, filt_frame);
-                av_log(NULL, AV_LOG_INFO, "\n\n the thread is %d, you can put frame is %ld \n", fl->f_thread,filt_frame->pts);
+                //av_log(NULL, AV_LOG_INFO, "\n\n the thread is %d, you can put frame is %ld \n", fl->f_thread,filt_frame->pts);
                 if (ret < 0) {
                     /* if no more frames for output - returns AVERROR(EAGAIN)
                      * if flushed and no more frames for output - returns AVERROR_EOF
@@ -676,7 +676,6 @@ static int flush_encoder(unsigned int i, unsigned int j)
     return ret;
 }
 
-
 int main(int argc, char **argv) {
     int ret;
     AVPacket packet = {.data = NULL, .size = 0};
@@ -689,13 +688,22 @@ int main(int argc, char **argv) {
     const char *input_file;
     OptionParserContext *opts_ctxs;
 
-    if (argc < 3) {
+    if (strcmp(argv[1], "-help") == 0) {
         av_log(NULL, AV_LOG_ERROR, "Usage: %s -i <input file> \ \n "
                                    "-nb_outputs 4 \ \n"
-                                   "-c:v libsvt_hevc -vf scale=7680:3840 -tune 1 -preset 9 -o o1.mp4 \ \n"
-                                   "-c:v libsvt_hevc -vf scale=1920:1080 -tune 1 -preset 9 -o o2.mp4 \ \n"
-                                   "-c:v libsvt_hevc -vf scale=1280:720 -tune 1 -preset 9 -o o3.mp4 \ \n"
-                                   "-c:v libsvt_hevc -vf scale=480:360 -tune 1 -preset 9 -o o4.mp4 \ \n", argv[0]);
+                                   "-c:v libsvt_hevc -vf scale=7680:3840 -rc 1 -b:v 13M -g 60 -tune 1 -preset 6 -o o1.mp4 \ \n"
+                                   "-c:v libsvt_hevc -vf scale=1920:1080 -rc 1 -b:v 4.5M -g 60 -tune 1 -preset 6 -o o2.mp4 \ \n"
+                                   "-c:v libsvt_hevc -vf scale=1280:720 -rc 1 -b:v 2M   -g 60 -tune 1 -preset 6 -o o3.mp4 \ \n"
+                                   "-c:v libsvt_hevc -vf scale=480:360  -rc 1 -b:v 0.5M -g 60 -tune 1 -preset 6 -o o4.mp4 \ \n", argv[0]);
+        return 1;
+    }
+
+    if (argc < 3) {
+        av_log(NULL, AV_LOG_ERROR, "Usage: %s -i <input file> -nb_outputs 4 \ \n"
+                                   "-c:v libsvt_hevc -vf scale=7680:3840 -rc 1 -b:v 13M -g 60 -tune 1 -preset 6 -o o1.mp4 \ \n"
+                                   "-c:v libsvt_hevc -vf scale=1920:1080 -rc 1 -b:v 4.5M -g 60 -tune 1 -preset 6 -o o2.mp4 \ \n"
+                                   "-c:v libsvt_hevc -vf scale=1280:720 -rc 1 -b:v 2M   -g 60 -tune 1 -preset 6 -o o3.mp4 \ \n"
+                                   "-c:v libsvt_hevc -vf scale=480:360  -rc 1 -b:v 0.5M -g 60 -tune 1 -preset 6 -o o4.mp4 \ \n", argv[0]);
         return 1;
     }
 
@@ -862,6 +870,21 @@ int main(int argc, char **argv) {
         if (ret < 0) {
             av_log(NULL, AV_LOG_ERROR, "Flushing filter failed\n");
             goto end;
+        }
+
+        // send EOF to filter_pipeline
+        if (abr_pipeline) {
+            for (int i = 0; i < ifmt_ctx->nb_streams; i++) {
+                for (int j = 0; j < nb_multi_output; j++) {
+                    int filter_id = i * nb_multi_output + j;
+                    filter_ctx[filter_id].waited_frm = NULL;
+                    pthread_mutex_lock(&filter_ctx[filter_id].process_mutex);
+                    filter_ctx[filter_id].t_end = 1;
+                    pthread_cond_signal(&filter_ctx[filter_id].process_cond);
+                    pthread_mutex_unlock(&filter_ctx[filter_id].process_mutex);
+                    pthread_join(filter_ctx[filter_id].f_thread, NULL);
+                }
+            }
         }
 
         // flush encoder
