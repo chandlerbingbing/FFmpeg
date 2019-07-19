@@ -27,7 +27,7 @@
  * API example for demuxing, decoding, filtering, encoding and muxing
  * @example transcoding.c
  */
-
+//#include "libavutil/timestamp.h"
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavfilter/buffersink.h>
@@ -37,6 +37,12 @@
 #include <pthread.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
+#include <libavutil/time.h>
+#include "libavutil/timestamp.h"
+#include <sys/time.h>
+
+#include <libavutil/frame.h>
 
 static AVFormatContext *ifmt_ctx;
 static AVFormatContext **ofmt_ctxs;
@@ -76,12 +82,20 @@ typedef struct FrameContext{
     unsigned int count_frame;
 } FrameContext;
 
+typedef struct BenchmarkTimeStamps {
+    int64_t real_usec;
+    int64_t user_usec;
+    int64_t sys_usec;
+} BenchmarkTimeStamps;
+
 static AVCodecContext **dec_ctxs;
 static AVCodecContext **enc_ctxs;
 
 //config options
 static int nb_multi_output = 0;
 const int abr_pipeline = 0;
+const int Test_alloc_tag = 1;// 1 is normal ,2 is test
+
 
 static int open_input_file(const char *filename)
 {
@@ -471,7 +485,9 @@ static int encode_write_frame(AVFrame *filt_frame, unsigned int i, int *got_fram
     av_init_packet(&enc_pkt);
     ret = enc_func(enc_ctxs[i * nb_multi_output + j], &enc_pkt,
             filt_frame, got_frame);
-    av_frame_free(&filt_frame);
+    if(Test_alloc_tag == 1)
+        av_frame_free(&filt_frame);
+
     if (ret < 0)
         return ret;
     if (!(*got_frame))
@@ -485,7 +501,8 @@ static int encode_write_frame(AVFrame *filt_frame, unsigned int i, int *got_fram
 
     av_log(NULL, AV_LOG_DEBUG, "Muxing frame\n");
     /* mux encoded frame */
-    ret = av_interleaved_write_frame(ofmt_ctxs[j], &enc_pkt);
+    if(Test_alloc_tag == 1)
+        ret = av_interleaved_write_frame(ofmt_ctxs[j], &enc_pkt);
     return ret;
 }
 
@@ -555,6 +572,13 @@ static int filter_encode_write_frame(FrameContext *frame_ctx) {
     frame = av_frame_alloc();
     unsigned int i = frame_ctx->input_stream_index;
     int count_frame = frame_ctx->count_frame;
+    AVFrame *filt_frame;
+    if(Test_alloc_tag == 1)
+        av_log(NULL, AV_LOG_INFO, "no test\n");
+    else
+        filt_frame = av_frame_alloc();
+
+    //filt_frame = av_frame_alloc();
 
     av_log(NULL, AV_LOG_INFO, "\n\n %d:Pushing decoded frame to filters \n", count_frame);
     /* push the decoded frame into the filtergraph */
@@ -579,9 +603,10 @@ static int filter_encode_write_frame(FrameContext *frame_ctx) {
             }
 
             /* pull filtered frames from the filtergraph */
-            AVFrame *filt_frame;
+
             while (1) {
-                filt_frame = av_frame_alloc();
+                if(Test_alloc_tag == 1)
+                    filt_frame = av_frame_alloc();
                 if (!filt_frame) {
                     ret = AVERROR(ENOMEM);
                     break;
@@ -595,7 +620,9 @@ static int filter_encode_write_frame(FrameContext *frame_ctx) {
                      */
                     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
                         ret = 0;
-                    av_frame_free(&filt_frame);
+                    if(Test_alloc_tag == 1)
+                        av_frame_free(&filt_frame);
+                    //get_frame_default(filt_frame);
                     break;
                 }
 
@@ -652,6 +679,10 @@ static int filter_encode_write_frame(FrameContext *frame_ctx) {
             }
         }
     }
+    if(Test_alloc_tag == 1)
+        av_log(NULL, AV_LOG_INFO, "no test\n");
+    else
+        av_frame_free(&filt_frame);
 
     return ret;
 }
@@ -688,6 +719,9 @@ int main(int argc, char **argv) {
     frame_ctx.count_frame = 0;
     const char *input_file;
     OptionParserContext *opts_ctxs;
+    //test time code
+    int64_t time_b,time_e;
+    //end
 
     if (argc < 3) {
         av_log(NULL, AV_LOG_ERROR, "Usage: %s -i <input file> \ \n "
@@ -757,6 +791,8 @@ int main(int argc, char **argv) {
     if ((ret = init_filters(nb_multi_output, opts_ctxs)) < 0)
         goto end;
 
+    time_b = av_gettime();
+    av_log(NULL, AV_LOG_INFO, "time begin %ld encoder\n", time_b);
     // read all packets
     while (1) {
         unsigned int i;
@@ -873,6 +909,11 @@ int main(int argc, char **argv) {
             }
         }
     }
+    //test time code
+    time_e = av_gettime();
+    av_log(NULL, AV_LOG_INFO, "time end %ld encoder\n", time_e);
+    av_log(NULL, AV_LOG_INFO, "time %ld milliseconds\n", (time_e-time_b)/1000);
+    //test end
 
     for (int j = 0; j < nb_multi_output; j++) {
         av_write_trailer(ofmt_ctxs[j]);
