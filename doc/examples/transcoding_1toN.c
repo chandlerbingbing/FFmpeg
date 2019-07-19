@@ -27,7 +27,6 @@
  * API example for demuxing, decoding, filtering, encoding and muxing
  * @example transcoding.c
  */
-
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavfilter/buffersink.h>
@@ -37,6 +36,10 @@
 #include <pthread.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
+#include <libavutil/time.h>
+#include "libavutil/timestamp.h"
+#include <sys/time.h>
 
 static AVFormatContext *ifmt_ctx;
 static AVFormatContext **ofmt_ctxs;
@@ -478,6 +481,7 @@ static int encode_write_frame(AVFrame *filt_frame, unsigned int i, int *got_fram
     ret = enc_func(enc_ctxs[i * nb_multi_output + j], &enc_pkt,
             filt_frame, got_frame);
     av_frame_free(&filt_frame);
+
     if (ret < 0)
         return ret;
     if (!(*got_frame))
@@ -601,7 +605,9 @@ static int filter_encode_write_frame(FrameContext *frame_ctx) {
                      */
                     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
                         ret = 0;
+
                     av_frame_free(&filt_frame);
+                    //get_frame_default(filt_frame);
                     break;
                 }
 
@@ -658,7 +664,6 @@ static int filter_encode_write_frame(FrameContext *frame_ctx) {
             }
         }
     }
-
     return ret;
 }
 
@@ -693,6 +698,9 @@ int main(int argc, char **argv) {
     frame_ctx.count_frame = 0;
     const char *input_file;
     OptionParserContext *opts_ctxs;
+    //test time code
+    int64_t time_b,time_e;
+    //end
 
     if (strcmp(argv[1], "-help") == 0) {
         av_log(NULL, AV_LOG_ERROR, "Usage: %s -i <input file> \ \n "
@@ -771,13 +779,14 @@ int main(int argc, char **argv) {
     if ((ret = init_filters(nb_multi_output, opts_ctxs)) < 0)
         goto end;
 
+    time_b = av_gettime();
+    av_log(NULL, AV_LOG_INFO, "time begin %ld encoder\n", time_b);
     // read all packets
     while (1) {
         unsigned int i;
 
         if ((ret = av_read_frame(ifmt_ctx, &packet)) < 0)
             break;
-
         frame_ctx.input_stream_index = packet.stream_index;
         i = packet.stream_index;
 
@@ -902,6 +911,11 @@ int main(int argc, char **argv) {
             }
         }
     }
+    //test time code
+    time_e = av_gettime();
+    av_log(NULL, AV_LOG_INFO, "time end %ld encoder\n", time_e);
+    av_log(NULL, AV_LOG_INFO, "time %ld milliseconds\n", (time_e-time_b)/1000);
+    //test end
 
     for (int j = 0; j < nb_multi_output; j++) {
         av_write_trailer(ofmt_ctxs[j]);
