@@ -81,8 +81,7 @@ static AVCodecContext **enc_ctxs;
 
 //config options
 static int nb_multi_output = 0;
-const int abr_pipeline = 0;
-static int64_t time_allco_s;
+const int abr_pipeline = 1;
 
 static int open_input_file(const char *filename)
 {
@@ -502,6 +501,14 @@ static void *filter_pipeline(void *arg) {
     int ret;
     unsigned int i = fl->i;
     unsigned int j = fl->j;
+    AVFrame *filt_frame;
+    filt_frame = av_frame_alloc();
+    if (!filt_frame) {
+        ret = AVERROR(ENOMEM);
+        fl->t_error = ret;
+        return;
+    }
+
     while (1) {
         pthread_mutex_lock(&fl->process_mutex);
         while (fl->waited_frm == NULL && !fl->t_end)
@@ -511,19 +518,11 @@ static void *filter_pipeline(void *arg) {
         frm = fl->waited_frm;
 
         ret = av_buffersrc_add_frame_flags(fl->buffersrc_ctx, frm, 0);
-        //av_log(NULL, AV_LOG_INFO, "\n\n the thread is %d, you can put frame is %ld \n", fl->f_thread,frm->pts);
         if (ret < 0) {
             av_log(NULL, AV_LOG_ERROR, "Error while feeding the filtergraph\n");
         } else {
-            AVFrame *filt_frame;
             while (1) {
-                filt_frame = av_frame_alloc();
-                if (!filt_frame) {
-                    ret = AVERROR(ENOMEM);
-                    break;
-                }
                 ret = av_buffersink_get_frame(fl->buffersink_ctx, filt_frame);
-                //av_log(NULL, AV_LOG_INFO, "\n\n the thread is %d, you can put frame is %ld \n", fl->f_thread,filt_frame->pts);
                 if (ret < 0) {
                     /* if no more frames for output - returns AVERROR(EAGAIN)
                      * if flushed and no more frames for output - returns AVERROR_EOF
@@ -531,7 +530,7 @@ static void *filter_pipeline(void *arg) {
                      */
                     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
                         ret = 0;
-                    av_frame_free(&filt_frame);
+                    av_frame_unref(filt_frame);
                     break;
                 }
 
@@ -551,6 +550,7 @@ static void *filter_pipeline(void *arg) {
         if (ret < 0)
             break;
     }
+    av_frame_free(&filt_frame);
     return;
 }
 
@@ -563,11 +563,7 @@ static int filter_encode_write_frame(FrameContext *frame_ctx) {
     unsigned int i = frame_ctx->input_stream_index;
     int count_frame = frame_ctx->count_frame;
     AVFrame *filt_frame;
-    int64_t tims,timd;
-    tims = av_gettime();
     filt_frame = av_frame_alloc();
-    timd = av_gettime();
-    time_allco_s += (timd-tims);
 
     av_log(NULL, AV_LOG_INFO, "\n\n %d:Pushing decoded frame to filters \n", count_frame);
     /* push the decoded frame into the filtergraph */
@@ -594,7 +590,6 @@ static int filter_encode_write_frame(FrameContext *frame_ctx) {
             /* pull filtered frames from the filtergraph */
 
             while (1) {
-
                 if (!filt_frame) {
                     ret = AVERROR(ENOMEM);
                     break;
@@ -780,7 +775,14 @@ int main(int argc, char **argv) {
     if ((ret = init_filters(nb_multi_output, opts_ctxs)) < 0)
         goto end;
 
+    frame_ctx.frame = av_frame_alloc();
+    if (!frame_ctx.frame) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+
     time_begin = av_gettime();
+
     // read all packets
     while (1) {
         unsigned int i;
@@ -795,8 +797,7 @@ int main(int argc, char **argv) {
 
         if (filter_ctx[i * nb_multi_output].filter_graph) {
 
-            av_log(NULL, AV_LOG_DEBUG, "Going to reencode&filter the frame\n");
-            frame_ctx.frame = av_frame_alloc();
+            av_log(NULL, AV_LOG_DEBUG, "Going to reencode & filter the frame\n");
             if (!frame_ctx.frame) {
                 ret = AVERROR(ENOMEM);
                 break;
@@ -809,7 +810,7 @@ int main(int argc, char **argv) {
             ret = dec_func(dec_ctxs[i], frame_ctx.frame,
                            &got_frame, &packet);
             if (ret < 0) {
-                av_frame_free(&frame_ctx.frame);
+                av_frame_unref(frame_ctx.frame);
                 av_log(NULL, AV_LOG_ERROR, "Decoding failed\n");
                 break;
             }
@@ -818,12 +819,12 @@ int main(int argc, char **argv) {
                 frame_ctx.count_frame++;
                 frame_ctx.frame->pts = frame_ctx.frame->best_effort_timestamp;
                 ret = filter_encode_write_frame(&frame_ctx);
-                av_frame_free(&frame_ctx.frame);
+                av_frame_unref(frame_ctx.frame);
                 if (ret < 0)
                     goto end;
             } else {
                 skipped_frame++;
-                av_frame_free(&frame_ctx.frame);
+                av_frame_unref(frame_ctx.frame);
             }
 
         } else {
@@ -845,7 +846,6 @@ int main(int argc, char **argv) {
     for (int stream_id = 0; stream_id < ifmt_ctx->nb_streams; stream_id++) {
         for (int i = skipped_frame; i > 0; i--) {
             frame_ctx.input_stream_index = stream_id;
-            frame_ctx.frame = av_frame_alloc();
             if (!frame_ctx.frame) {
                 ret = AVERROR(ENOMEM);
                 break;
@@ -856,20 +856,20 @@ int main(int argc, char **argv) {
             ret = dec_func(dec_ctxs[stream_id], frame_ctx.frame,
                            &got_frame, &packet);
             if (ret < 0) {
-                av_frame_free(&frame_ctx.frame);
+                av_frame_unref(frame_ctx.frame);
                 av_log(NULL, AV_LOG_ERROR, "Decoding failed\n");
-                break;
+                goto end;
             }
 
             if (got_frame) {
                 frame_ctx.count_frame++;
                 frame_ctx.frame->pts = frame_ctx.frame->best_effort_timestamp;
                 ret = filter_encode_write_frame(&frame_ctx);
-                av_frame_free(&frame_ctx.frame);
+                av_frame_unref(frame_ctx.frame);
                 if (ret < 0)
                     goto end;
             } else {
-                av_frame_free(&frame_ctx.frame);
+                av_frame_unref(frame_ctx.frame);
             }
         }
     }
