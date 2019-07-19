@@ -36,10 +36,7 @@
 #include <pthread.h>
 #include <string.h>
 #include <stdio.h>
-#include <time.h>
 #include <libavutil/time.h>
-#include "libavutil/timestamp.h"
-#include <sys/time.h>
 
 static AVFormatContext *ifmt_ctx;
 static AVFormatContext **ofmt_ctxs;
@@ -131,7 +128,13 @@ static int open_input_file(const char *filename)
             if (codec_ctx->codec_type == AVMEDIA_TYPE_VIDEO)
                 codec_ctx->framerate = av_guess_frame_rate(ifmt_ctx, stream, NULL);
             /* Open decoder */
+#ifdef DECODE_THREAD_1
+            AVDictionary *dec_opt=NULL;
+            av_dict_set(&dec_opt,"threads","1", 0);
+            ret = avcodec_open2(codec_ctx, dec, &dec_opt);
+#endif
             ret = avcodec_open2(codec_ctx, dec, NULL);
+
             if (ret < 0) {
                 av_log(NULL, AV_LOG_ERROR, "Failed to open decoder for stream #%u\n", i);
                 return ret;
@@ -475,11 +478,7 @@ static int encode_write_frame(AVFrame *filt_frame, unsigned int i, int *got_fram
     av_init_packet(&enc_pkt);
     ret = enc_func(enc_ctxs[i * nb_multi_output + j], &enc_pkt,
             filt_frame, got_frame);
-    int64_t tims,timd;
-    tims = av_gettime();
     av_frame_unref(filt_frame);
-    timd = av_gettime();
-    time_allco_s += (timd-tims);
     if (ret < 0)
         return ret;
     if (!(*got_frame))
@@ -512,7 +511,7 @@ static void *filter_pipeline(void *arg) {
         frm = fl->waited_frm;
 
         ret = av_buffersrc_add_frame_flags(fl->buffersrc_ctx, frm, 0);
-        av_log(NULL, AV_LOG_INFO, "\n\n the thread is %d, you can put frame is %ld \n", fl->f_thread,frm->pts);
+        //av_log(NULL, AV_LOG_INFO, "\n\n the thread is %d, you can put frame is %ld \n", fl->f_thread,frm->pts);
         if (ret < 0) {
             av_log(NULL, AV_LOG_ERROR, "Error while feeding the filtergraph\n");
         } else {
@@ -524,7 +523,7 @@ static void *filter_pipeline(void *arg) {
                     break;
                 }
                 ret = av_buffersink_get_frame(fl->buffersink_ctx, filt_frame);
-                av_log(NULL, AV_LOG_INFO, "\n\n the thread is %d, you can put frame is %ld \n", fl->f_thread,filt_frame->pts);
+                //av_log(NULL, AV_LOG_INFO, "\n\n the thread is %d, you can put frame is %ld \n", fl->f_thread,filt_frame->pts);
                 if (ret < 0) {
                     /* if no more frames for output - returns AVERROR(EAGAIN)
                      * if flushed and no more frames for output - returns AVERROR_EOF
@@ -611,7 +610,6 @@ static int filter_encode_write_frame(FrameContext *frame_ctx) {
                         ret = 0;
 
                     av_frame_unref(filt_frame);
-                    //get_frame_default(filt_frame);
                     break;
                 }
 
@@ -692,7 +690,6 @@ static int flush_encoder(unsigned int i, unsigned int j)
     return ret;
 }
 
-
 int main(int argc, char **argv) {
     int ret;
     AVPacket packet = {.data = NULL, .size = 0};
@@ -704,17 +701,24 @@ int main(int argc, char **argv) {
     frame_ctx.count_frame = 0;
     const char *input_file;
     OptionParserContext *opts_ctxs;
-    //test time code
-    int64_t time_b,time_e;
-    //end
+    int64_t time_begin,time_end;
 
-    if (argc < 3) {
+    if (strcmp(argv[1], "-help") == 0) {
         av_log(NULL, AV_LOG_ERROR, "Usage: %s -i <input file> \ \n "
                                    "-nb_outputs 4 \ \n"
-                                   "-c:v libsvt_hevc -vf scale=7680:3840 -tune 1 -preset 9 -o o1.mp4 \ \n"
-                                   "-c:v libsvt_hevc -vf scale=1920:1080 -tune 1 -preset 9 -o o2.mp4 \ \n"
-                                   "-c:v libsvt_hevc -vf scale=1280:720 -tune 1 -preset 9 -o o3.mp4 \ \n"
-                                   "-c:v libsvt_hevc -vf scale=480:360 -tune 1 -preset 9 -o o4.mp4 \ \n", argv[0]);
+                                   "-c:v libsvt_hevc -vf scale=7680:3840 -rc 1 -b:v 13M -g 60 -tune 1 -preset 6 -o o1.mp4 \ \n"
+                                   "-c:v libsvt_hevc -vf scale=1920:1080 -rc 1 -b:v 4.5M -g 60 -tune 1 -preset 6 -o o2.mp4 \ \n"
+                                   "-c:v libsvt_hevc -vf scale=1280:720 -rc 1 -b:v 2M   -g 60 -tune 1 -preset 6 -o o3.mp4 \ \n"
+                                   "-c:v libsvt_hevc -vf scale=480:360  -rc 1 -b:v 0.5M -g 60 -tune 1 -preset 6 -o o4.mp4 \ \n", argv[0]);
+        return 1;
+    }
+
+    if (argc < 3) {
+        av_log(NULL, AV_LOG_ERROR, "Usage: %s -i <input file> -nb_outputs 4 \ \n"
+                                   "-c:v libsvt_hevc -vf scale=7680:3840 -rc 1 -b:v 13M -g 60 -tune 1 -preset 6 -o o1.mp4 \ \n"
+                                   "-c:v libsvt_hevc -vf scale=1920:1080 -rc 1 -b:v 4.5M -g 60 -tune 1 -preset 6 -o o2.mp4 \ \n"
+                                   "-c:v libsvt_hevc -vf scale=1280:720 -rc 1 -b:v 2M   -g 60 -tune 1 -preset 6 -o o3.mp4 \ \n"
+                                   "-c:v libsvt_hevc -vf scale=480:360  -rc 1 -b:v 0.5M -g 60 -tune 1 -preset 6 -o o4.mp4 \ \n", argv[0]);
         return 1;
     }
 
@@ -776,7 +780,7 @@ int main(int argc, char **argv) {
     if ((ret = init_filters(nb_multi_output, opts_ctxs)) < 0)
         goto end;
 
-    time_b = av_gettime();
+    time_begin = av_gettime();
     // read all packets
     while (1) {
         unsigned int i;
@@ -883,6 +887,21 @@ int main(int argc, char **argv) {
             goto end;
         }
 
+        // send EOF to filter_pipeline
+        if (abr_pipeline) {
+            for (int i = 0; i < ifmt_ctx->nb_streams; i++) {
+                for (int j = 0; j < nb_multi_output; j++) {
+                    int filter_id = i * nb_multi_output + j;
+                    filter_ctx[filter_id].waited_frm = NULL;
+                    pthread_mutex_lock(&filter_ctx[filter_id].process_mutex);
+                    filter_ctx[filter_id].t_end = 1;
+                    pthread_cond_signal(&filter_ctx[filter_id].process_cond);
+                    pthread_mutex_unlock(&filter_ctx[filter_id].process_mutex);
+                    pthread_join(filter_ctx[filter_id].f_thread, NULL);
+                }
+            }
+        }
+
         // flush encoder
         for (int j = 0; j < nb_multi_output; j++) {
             ret = flush_encoder(i, j);
@@ -892,11 +911,9 @@ int main(int argc, char **argv) {
             }
         }
     }
-    //test time code
-    time_e = av_gettime();
-    av_log(NULL, AV_LOG_INFO, "program time %ld milliseconds\n", (time_e-time_b)/1000);
-    av_log(NULL, AV_LOG_INFO, "alloc time %ld milliseconds\n", time_allco_s/1000);
-    //test end
+
+    time_end = av_gettime();
+    av_log(NULL, AV_LOG_INFO, "time %ld milliseconds\n", (time_end-time_begin)/1000);
 
     for (int j = 0; j < nb_multi_output; j++) {
         av_write_trailer(ofmt_ctxs[j]);
