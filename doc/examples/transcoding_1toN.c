@@ -81,8 +81,7 @@ static AVCodecContext **enc_ctxs;
 
 //config options
 static int nb_multi_output = 0;
-const int abr_pipeline = 0;
-static int64_t time_allco_s;
+const int abr_pipeline = 1;
 
 static int open_input_file(const char *filename)
 {
@@ -563,11 +562,9 @@ static int filter_encode_write_frame(FrameContext *frame_ctx) {
     unsigned int i = frame_ctx->input_stream_index;
     int count_frame = frame_ctx->count_frame;
     AVFrame *filt_frame;
-    int64_t tims,timd;
-    tims = av_gettime();
     filt_frame = av_frame_alloc();
-    timd = av_gettime();
-    time_allco_s += (timd-tims);
+
+
 
     av_log(NULL, AV_LOG_INFO, "\n\n %d:Pushing decoded frame to filters \n", count_frame);
     /* push the decoded frame into the filtergraph */
@@ -922,25 +919,36 @@ int main(int argc, char **argv) {
     end:
     free(opts_ctxs);
     av_packet_unref(&packet);
-    av_frame_free(&frame_ctx.frame);
-    for (int i = 0; i < ifmt_ctx->nb_streams; i++) {
-        avcodec_free_context(&dec_ctxs[i]);
-        for (int j = 0; j < nb_multi_output; j++) {
-            int id = i * nb_multi_output + j;
-            if (ofmt_ctxs[j] && ofmt_ctxs[j]->nb_streams > i && ofmt_ctxs[j]->streams[i] && enc_ctxs[id])
-                avcodec_free_context(&enc_ctxs[id]);
-            if (filter_ctx && filter_ctx[id].filter_graph)
-                avfilter_graph_free(&filter_ctx[id].filter_graph);
+    if(frame_ctx.frame)
+        av_frame_free(&frame_ctx.frame);
+    if(ifmt_ctx) {
+        for (int i = 0; i < ifmt_ctx->nb_streams; i++) {
+            if (dec_ctxs[i])
+                avcodec_free_context(&dec_ctxs[i]);
+            if(ofmt_ctxs) {
+                for (int j = 0; j < nb_multi_output; j++) {
+                    int id = i * nb_multi_output + j;
+                    if (ofmt_ctxs[j] && ofmt_ctxs[j]->nb_streams > i && ofmt_ctxs[j]->streams[i] && enc_ctxs[id])
+                        avcodec_free_context(&enc_ctxs[id]);
+                    if (filter_ctx && filter_ctx[id].filter_graph)
+                        avfilter_graph_free(&filter_ctx[id].filter_graph);
+                }
+            }
         }
     }
-    av_free(filter_ctx);
-    av_free(dec_ctxs);
-    av_free(enc_ctxs);
-    avformat_close_input(&ifmt_ctx);
+    if(filter_ctx)
+        av_free(filter_ctx);
+    if(dec_ctxs)
+        av_free(dec_ctxs);
+    if(enc_ctxs)
+        av_free(enc_ctxs);
+    if(ifmt_ctx)
+        avformat_close_input(&ifmt_ctx);
     for (int j = 0; j < nb_multi_output; j++) {
         if (ofmt_ctxs[j] && !(ofmt_ctxs[j]->oformat->flags & AVFMT_NOFILE))
             avio_closep(&ofmt_ctxs[j]->pb);
-        avformat_free_context(ofmt_ctxs[j]);
+        if(ofmt_ctxs[j])
+            avformat_free_context(ofmt_ctxs[j]);
     }
     if (ret < 0)
         av_log(NULL, AV_LOG_ERROR, "Error occurred: %s\n", av_err2str(ret));
