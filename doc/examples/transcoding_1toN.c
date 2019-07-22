@@ -37,6 +37,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <libavutil/time.h>
+#include <unistd.h>
 
 static AVFormatContext *ifmt_ctx;
 static AVFormatContext **ofmt_ctxs;
@@ -51,6 +52,8 @@ typedef struct OptionParserContext {
     int height;
 } OptionParserContext;
 
+#define BUF_SIZE 10
+
 typedef struct FilteringContext {
     AVFilterContext *buffersink_ctx;
     AVFilterContext *buffersrc_ctx;
@@ -58,8 +61,10 @@ typedef struct FilteringContext {
     unsigned int i;
     unsigned int j;
     // for abr pipeline
-    AVFrame *waited_frm;
-    AVFrame input_frm;
+    AVFrame *waited_frm[BUF_SIZE];
+    int buf_head;
+    int buf_tail;
+    AVFrame *input_frm;
     pthread_t f_thread;
     pthread_cond_t process_cond;
     pthread_cond_t finish_cond;
@@ -81,7 +86,7 @@ static AVCodecContext **enc_ctxs;
 
 //config options
 static int nb_multi_output = 0;
-const int abr_pipeline = 1;
+const int abr_pipeline = 0;
 
 static int open_input_file(const char *filename)
 {
@@ -256,9 +261,6 @@ static int init_output_file(OptionParserContext *opts_ctxs)
         }
 
         /* init muxer, write output file header */
-        //AVDictionary *opt = NULL;
-        //av_dict_set_int(&opt, "video_track_timescale", 60, 0);
-        //ret = avformat_write_header(ofmt_ctxs[j], &opt);
         ret = avformat_write_header(ofmt_ctxs[j], NULL);
         if (ret < 0) {
             av_log(NULL, AV_LOG_ERROR, "Error occurred when opening output file\n");
@@ -288,7 +290,11 @@ static int init_filter(FilteringContext* fctx, AVCodecContext *dec_ctx,
 
     if(abr_pipeline){
         fctx->f_thread = 0;
+        fctx->buf_head = 0;
+        fctx->buf_tail = 0;
     }
+
+    fctx->input_frm = av_frame_alloc();
 
     if (dec_ctx->codec_type == AVMEDIA_TYPE_VIDEO) {
         buffersrc = avfilter_get_by_name("buffer");
@@ -497,32 +503,40 @@ static int encode_write_frame(AVFrame *filt_frame, unsigned int i, int *got_fram
 
 static void *filter_pipeline(void *arg) {
     FilteringContext *fl = arg;
-    AVFrame *frm;
     int ret;
     unsigned int i = fl->i;
     unsigned int j = fl->j;
+    AVFrame *filt_frame;
+    filt_frame = av_frame_alloc();
+    if (!filt_frame) {
+        ret = AVERROR(ENOMEM);
+        fl->t_error = ret;
+        return;
+    }
+
     while (1) {
         pthread_mutex_lock(&fl->process_mutex);
-        while (fl->waited_frm == NULL && !fl->t_end)
+        while (fl->buf_head == fl->buf_tail && !fl->t_end) //wait if the buffer is empty
             pthread_cond_wait(&fl->process_cond, &fl->process_mutex);
         pthread_mutex_unlock(&fl->process_mutex);
         if (fl->t_end) break;
-        frm = fl->waited_frm;
+        fl->input_frm = fl->waited_frm[fl->buf_head];
 
-        ret = av_buffersrc_add_frame_flags(fl->buffersrc_ctx, frm, 0);
-        //av_log(NULL, AV_LOG_INFO, "\n\n the thread is %d, you can put frame is %ld \n", fl->f_thread,frm->pts);
+        /*debug multiple pipeline*/
+/*
+        if(frm) {
+            av_log(NULL, AV_LOG_INFO, "filter_pipeline: head:%d, tail:%d,frame: w%d,h%d,fmt%d\n",
+                   fl->buf_head,
+                   fl->buf_tail,
+                   frm->width, frm->height, frm->format);
+        }
+*/
+        ret = av_buffersrc_add_frame_flags(fl->buffersrc_ctx, fl->input_frm, 0);
         if (ret < 0) {
             av_log(NULL, AV_LOG_ERROR, "Error while feeding the filtergraph\n");
         } else {
-            AVFrame *filt_frame;
             while (1) {
-                filt_frame = av_frame_alloc();
-                if (!filt_frame) {
-                    ret = AVERROR(ENOMEM);
-                    break;
-                }
                 ret = av_buffersink_get_frame(fl->buffersink_ctx, filt_frame);
-                //av_log(NULL, AV_LOG_INFO, "\n\n the thread is %d, you can put frame is %ld \n", fl->f_thread,filt_frame->pts);
                 if (ret < 0) {
                     /* if no more frames for output - returns AVERROR(EAGAIN)
                      * if flushed and no more frames for output - returns AVERROR_EOF
@@ -530,7 +544,7 @@ static void *filter_pipeline(void *arg) {
                      */
                     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
                         ret = 0;
-                    av_frame_free(&filt_frame);
+                    av_frame_unref(filt_frame);
                     break;
                 }
 
@@ -543,13 +557,15 @@ static void *filter_pipeline(void *arg) {
         fl->t_error = ret;
 
         pthread_mutex_lock(&fl->finish_mutex);
-        fl->waited_frm = NULL;
+        fl->waited_frm[fl->buf_head] = NULL;
+        fl->buf_head = (fl->buf_head + 1) % BUF_SIZE;
         pthread_cond_signal(&fl->finish_cond);
         pthread_mutex_unlock(&fl->finish_mutex);
 
         if (ret < 0)
             break;
     }
+    av_frame_free(&filt_frame);
     return;
 }
 
@@ -557,21 +573,21 @@ static int filter_encode_write_frame(FrameContext *frame_ctx) {
     int ret;
     unsigned int j;
     AVFrame *decoded_frame = frame_ctx->frame;
-    AVFrame *frame;
-    frame = av_frame_alloc();
     unsigned int i = frame_ctx->input_stream_index;
     int count_frame = frame_ctx->count_frame;
-    AVFrame *filt_frame;
-    filt_frame = av_frame_alloc();
-
 
 
     av_log(NULL, AV_LOG_INFO, "\n\n %d:Pushing decoded frame to filters \n", count_frame);
     /* push the decoded frame into the filtergraph */
-    for (j = 0; j < nb_multi_output; j++) {
-        int filter_id = i * nb_multi_output + j;
+    if (!abr_pipeline) {
+        AVFrame *filt_frame;
+        filt_frame = av_frame_alloc();
 
-        if (!abr_pipeline) {
+        for (j = 0; j < nb_multi_output; j++) {
+            int filter_id = i * nb_multi_output + j;
+
+            AVFrame *frame;
+            frame = filter_ctx[filter_id].input_frm;
 
             if ((j < nb_multi_output - 1) && decoded_frame) {
                 ret = av_frame_ref(frame, decoded_frame);
@@ -591,7 +607,6 @@ static int filter_encode_write_frame(FrameContext *frame_ctx) {
             /* pull filtered frames from the filtergraph */
 
             while (1) {
-
                 if (!filt_frame) {
                     ret = AVERROR(ENOMEM);
                     break;
@@ -615,11 +630,18 @@ static int filter_encode_write_frame(FrameContext *frame_ctx) {
                 if (ret < 0)
                     break;
             }
-        } else {
-            frame = &filter_ctx[filter_id].input_frm;
-            if ((j < nb_multi_output - 1) && decoded_frame) {
+        }
+        av_frame_free(&filt_frame);
+    } else {
+        for (j = 0; j < nb_multi_output; j++) {
+            int filter_id = i * nb_multi_output + j;
+
+            AVFrame *frame;
+            frame = filter_ctx[filter_id].input_frm;
+
+            if (decoded_frame) {
                 ret = av_frame_ref(frame, decoded_frame);
-                if(ret < 0){
+                if (ret < 0) {
                     break;
                 }
             } else {
@@ -628,11 +650,15 @@ static int filter_encode_write_frame(FrameContext *frame_ctx) {
             filter_ctx[filter_id].i = i;
             filter_ctx[filter_id].j = j;
 
-            if(filter_ctx[filter_id].f_thread == 0){
-                if ((ret = pthread_create(&filter_ctx[filter_id].f_thread, NULL, filter_pipeline, &filter_ctx[filter_id]))) {
-                    av_log(NULL, AV_LOG_ERROR, "pthread_create failed: %s. Try to increase `ulimit -v` or decrease `ulimit -s`.\n", strerror(ret));
+            if (filter_ctx[filter_id].f_thread == 0) {
+                if ((ret = pthread_create(&filter_ctx[filter_id].f_thread, NULL, filter_pipeline,
+                                          &filter_ctx[filter_id]))) {
+                    av_log(NULL, AV_LOG_ERROR,
+                           "pthread_create failed: %s. Try to increase `ulimit -v` or decrease `ulimit -s`.\n",
+                           strerror(ret));
                     return AVERROR(ret);
                 }
+                av_log(NULL, AV_LOG_INFO, "initialize pthread\n");
                 pthread_mutex_init(&filter_ctx[filter_id].process_mutex, NULL);
                 pthread_mutex_init(&filter_ctx[filter_id].finish_mutex, NULL);
                 pthread_cond_init(&filter_ctx[filter_id].process_cond, NULL);
@@ -640,18 +666,22 @@ static int filter_encode_write_frame(FrameContext *frame_ctx) {
                 filter_ctx[filter_id].t_end = 0;
                 filter_ctx[filter_id].t_error = 0;
             }
+            /*debug multiple pipeline*/
+            /*
+            av_log(NULL, AV_LOG_INFO, "producer_pipeline: head:%d, tail:%d\n",
+                   filter_ctx[filter_id].buf_head,
+                   filter_ctx[filter_id].buf_tail);
+            */
             pthread_mutex_lock(&filter_ctx[filter_id].process_mutex);
-            filter_ctx[filter_id].waited_frm = frame;
+            filter_ctx[filter_id].waited_frm[filter_ctx[filter_id].buf_tail] = frame;
+            filter_ctx[filter_id].buf_tail = (filter_ctx[filter_id].buf_tail + 1) % BUF_SIZE;
             pthread_cond_signal(&filter_ctx[filter_id].process_cond);
             pthread_mutex_unlock(&filter_ctx[filter_id].process_mutex);
         }
-    }
-
-    if (abr_pipeline) {
         for (j = 0; j < nb_multi_output; j++) {
             int filter_id = i * nb_multi_output + j;
             pthread_mutex_lock(&filter_ctx[filter_id].finish_mutex);
-            while (filter_ctx[filter_id].waited_frm != NULL)
+            while (filter_ctx[filter_id].buf_head == (filter_ctx[filter_id].buf_tail + 1) % BUF_SIZE)
                 pthread_cond_wait(&filter_ctx[filter_id].finish_cond, &filter_ctx[filter_id].finish_mutex);
             pthread_mutex_unlock(&filter_ctx[filter_id].finish_mutex);
         }
@@ -663,7 +693,6 @@ static int filter_encode_write_frame(FrameContext *frame_ctx) {
             }
         }
     }
-    av_frame_free(&filt_frame);
     return ret;
 }
 
@@ -777,7 +806,14 @@ int main(int argc, char **argv) {
     if ((ret = init_filters(nb_multi_output, opts_ctxs)) < 0)
         goto end;
 
+    frame_ctx.frame = av_frame_alloc();
+    if (!frame_ctx.frame) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+
     time_begin = av_gettime();
+
     // read all packets
     while (1) {
         unsigned int i;
@@ -792,8 +828,7 @@ int main(int argc, char **argv) {
 
         if (filter_ctx[i * nb_multi_output].filter_graph) {
 
-            av_log(NULL, AV_LOG_DEBUG, "Going to reencode&filter the frame\n");
-            frame_ctx.frame = av_frame_alloc();
+            av_log(NULL, AV_LOG_DEBUG, "Going to reencode & filter the frame\n");
             if (!frame_ctx.frame) {
                 ret = AVERROR(ENOMEM);
                 break;
@@ -806,7 +841,7 @@ int main(int argc, char **argv) {
             ret = dec_func(dec_ctxs[i], frame_ctx.frame,
                            &got_frame, &packet);
             if (ret < 0) {
-                av_frame_free(&frame_ctx.frame);
+                av_frame_unref(frame_ctx.frame);
                 av_log(NULL, AV_LOG_ERROR, "Decoding failed\n");
                 break;
             }
@@ -815,12 +850,12 @@ int main(int argc, char **argv) {
                 frame_ctx.count_frame++;
                 frame_ctx.frame->pts = frame_ctx.frame->best_effort_timestamp;
                 ret = filter_encode_write_frame(&frame_ctx);
-                av_frame_free(&frame_ctx.frame);
+                av_frame_unref(frame_ctx.frame);
                 if (ret < 0)
                     goto end;
             } else {
                 skipped_frame++;
-                av_frame_free(&frame_ctx.frame);
+                av_frame_unref(frame_ctx.frame);
             }
 
         } else {
@@ -842,7 +877,6 @@ int main(int argc, char **argv) {
     for (int stream_id = 0; stream_id < ifmt_ctx->nb_streams; stream_id++) {
         for (int i = skipped_frame; i > 0; i--) {
             frame_ctx.input_stream_index = stream_id;
-            frame_ctx.frame = av_frame_alloc();
             if (!frame_ctx.frame) {
                 ret = AVERROR(ENOMEM);
                 break;
@@ -853,20 +887,20 @@ int main(int argc, char **argv) {
             ret = dec_func(dec_ctxs[stream_id], frame_ctx.frame,
                            &got_frame, &packet);
             if (ret < 0) {
-                av_frame_free(&frame_ctx.frame);
+                av_frame_unref(frame_ctx.frame);
                 av_log(NULL, AV_LOG_ERROR, "Decoding failed\n");
-                break;
+                goto end;
             }
 
             if (got_frame) {
                 frame_ctx.count_frame++;
                 frame_ctx.frame->pts = frame_ctx.frame->best_effort_timestamp;
                 ret = filter_encode_write_frame(&frame_ctx);
-                av_frame_free(&frame_ctx.frame);
+                av_frame_unref(frame_ctx.frame);
                 if (ret < 0)
                     goto end;
             } else {
-                av_frame_free(&frame_ctx.frame);
+                av_frame_unref(frame_ctx.frame);
             }
         }
     }
@@ -889,7 +923,9 @@ int main(int argc, char **argv) {
             for (int i = 0; i < ifmt_ctx->nb_streams; i++) {
                 for (int j = 0; j < nb_multi_output; j++) {
                     int filter_id = i * nb_multi_output + j;
-                    filter_ctx[filter_id].waited_frm = NULL;
+                    for(int z = 0; z < BUF_SIZE; z++){
+                        filter_ctx[filter_id].waited_frm[z] = NULL;
+                    }
                     pthread_mutex_lock(&filter_ctx[filter_id].process_mutex);
                     filter_ctx[filter_id].t_end = 1;
                     pthread_cond_signal(&filter_ctx[filter_id].process_cond);
@@ -930,8 +966,10 @@ int main(int argc, char **argv) {
                     int id = i * nb_multi_output + j;
                     if (ofmt_ctxs[j] && ofmt_ctxs[j]->nb_streams > i && ofmt_ctxs[j]->streams[i] && enc_ctxs[id])
                         avcodec_free_context(&enc_ctxs[id]);
-                    if (filter_ctx && filter_ctx[id].filter_graph)
+                    if (filter_ctx && filter_ctx[id].filter_graph) {
                         avfilter_graph_free(&filter_ctx[id].filter_graph);
+                        av_frame_free(filter_ctx[id].input_frm);
+                    }
                 }
             }
         }
