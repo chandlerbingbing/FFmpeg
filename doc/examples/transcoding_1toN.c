@@ -86,7 +86,7 @@ static AVCodecContext **enc_ctxs;
 
 //config options
 static int nb_multi_output = 0;
-const int abr_pipeline = 0;
+const int abr_pipeline = 1;
 
 static int open_input_file(const char *filename)
 {
@@ -557,7 +557,10 @@ static void *filter_pipeline(void *arg) {
         fl->t_error = ret;
 
         pthread_mutex_lock(&fl->finish_mutex);
-        fl->waited_frm[fl->buf_head] = NULL;
+        if(fl->waited_frm[fl->buf_head]){
+            av_frame_free(&(fl->waited_frm[fl->buf_head]));
+            fl->waited_frm[fl->buf_head] = NULL;
+        }
         fl->buf_head = (fl->buf_head + 1) % BUF_SIZE;
         pthread_cond_signal(&fl->finish_cond);
         pthread_mutex_unlock(&fl->finish_mutex);
@@ -637,7 +640,7 @@ static int filter_encode_write_frame(FrameContext *frame_ctx) {
             int filter_id = i * nb_multi_output + j;
 
             AVFrame *frame;
-            frame = filter_ctx[filter_id].input_frm;
+            frame = av_frame_alloc();
 
             if (decoded_frame) {
                 ret = av_frame_ref(frame, decoded_frame);
@@ -645,6 +648,7 @@ static int filter_encode_write_frame(FrameContext *frame_ctx) {
                     break;
                 }
             } else {
+                av_frame_free(&frame);
                 frame = decoded_frame;
             }
             filter_ctx[filter_id].i = i;
