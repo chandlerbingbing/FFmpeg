@@ -52,7 +52,7 @@ typedef struct OptionParserContext {
     int height;
 } OptionParserContext;
 
-#define BUF_SIZE 10
+#define BUF_SIZE 50
 
 typedef struct FilteringContext {
     AVFilterContext *buffersink_ctx;
@@ -483,7 +483,7 @@ static int encode_write_frame(AVFrame *filt_frame, unsigned int i, int *got_fram
     av_init_packet(&enc_pkt);
     ret = enc_func(enc_ctxs[i * nb_multi_output + j], &enc_pkt,
             filt_frame, got_frame);
-    av_frame_unref(filt_frame);
+    av_frame_free(&filt_frame);
     if (ret < 0)
         return ret;
     if (!(*got_frame))
@@ -497,7 +497,8 @@ static int encode_write_frame(AVFrame *filt_frame, unsigned int i, int *got_fram
 
     av_log(NULL, AV_LOG_DEBUG, "Muxing frame\n");
     /* mux encoded frame */
-    ret = av_interleaved_write_frame(ofmt_ctxs[j], &enc_pkt);
+    //ret = av_interleaved_write_frame(ofmt_ctxs[j], &enc_pkt);
+    ret =0;
     return ret;
 }
 
@@ -507,12 +508,6 @@ static void *filter_pipeline(void *arg) {
     unsigned int i = fl->i;
     unsigned int j = fl->j;
     AVFrame *filt_frame;
-    filt_frame = av_frame_alloc();
-    if (!filt_frame) {
-        ret = AVERROR(ENOMEM);
-        fl->t_error = ret;
-        return;
-    }
 
     while (1) {
         pthread_mutex_lock(&fl->process_mutex);
@@ -536,6 +531,12 @@ static void *filter_pipeline(void *arg) {
             av_log(NULL, AV_LOG_ERROR, "Error while feeding the filtergraph\n");
         } else {
             while (1) {
+                filt_frame = av_frame_alloc();
+                if (!filt_frame) {
+                    ret = AVERROR(ENOMEM);
+                    fl->t_error = ret;
+                    return;
+                }
                 ret = av_buffersink_get_frame(fl->buffersink_ctx, filt_frame);
                 if (ret < 0) {
                     /* if no more frames for output - returns AVERROR(EAGAIN)
@@ -544,7 +545,7 @@ static void *filter_pipeline(void *arg) {
                      */
                     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
                         ret = 0;
-                    av_frame_unref(filt_frame);
+                    av_frame_free(&filt_frame);
                     break;
                 }
 
@@ -568,7 +569,6 @@ static void *filter_pipeline(void *arg) {
         if (ret < 0)
             break;
     }
-    av_frame_free(&filt_frame);
     return;
 }
 
@@ -640,16 +640,13 @@ static int filter_encode_write_frame(FrameContext *frame_ctx) {
             int filter_id = i * nb_multi_output + j;
 
             AVFrame *frame;
-            frame = av_frame_alloc();
-
-            if (decoded_frame) {
-                ret = av_frame_ref(frame, decoded_frame);
-                if (ret < 0) {
+            if (frame_ctx->frame) {
+                frame = av_frame_clone(frame_ctx->frame);
+                if (!frame) {
                     break;
                 }
             } else {
-                av_frame_free(&frame);
-                frame = decoded_frame;
+                frame = frame_ctx->frame;
             }
             filter_ctx[filter_id].i = i;
             filter_ctx[filter_id].j = j;
@@ -810,12 +807,6 @@ int main(int argc, char **argv) {
     if ((ret = init_filters(nb_multi_output, opts_ctxs)) < 0)
         goto end;
 
-    frame_ctx.frame = av_frame_alloc();
-    if (!frame_ctx.frame) {
-        ret = AVERROR(ENOMEM);
-        goto end;
-    }
-
     time_begin = av_gettime();
 
     // read all packets
@@ -824,6 +815,11 @@ int main(int argc, char **argv) {
 
         if ((ret = av_read_frame(ifmt_ctx, &packet)) < 0)
             break;
+        frame_ctx.frame = av_frame_alloc();
+        if (!frame_ctx.frame) {
+            ret = AVERROR(ENOMEM);
+            goto end;
+        }
         frame_ctx.input_stream_index = packet.stream_index;
         i = packet.stream_index;
 
@@ -833,10 +829,6 @@ int main(int argc, char **argv) {
         if (filter_ctx[i * nb_multi_output].filter_graph) {
 
             av_log(NULL, AV_LOG_DEBUG, "Going to reencode & filter the frame\n");
-            if (!frame_ctx.frame) {
-                ret = AVERROR(ENOMEM);
-                break;
-            }
             av_packet_rescale_ts(&packet,
                                  ifmt_ctx->streams[i]->time_base,
                                  dec_ctxs[i]->time_base);
@@ -845,7 +837,7 @@ int main(int argc, char **argv) {
             ret = dec_func(dec_ctxs[i], frame_ctx.frame,
                            &got_frame, &packet);
             if (ret < 0) {
-                av_frame_unref(frame_ctx.frame);
+                av_frame_free(&frame_ctx.frame);
                 av_log(NULL, AV_LOG_ERROR, "Decoding failed\n");
                 break;
             }
@@ -854,22 +846,24 @@ int main(int argc, char **argv) {
                 frame_ctx.count_frame++;
                 frame_ctx.frame->pts = frame_ctx.frame->best_effort_timestamp;
                 ret = filter_encode_write_frame(&frame_ctx);
-                av_frame_unref(frame_ctx.frame);
+                av_frame_free(&frame_ctx.frame);
                 if (ret < 0)
                     goto end;
             } else {
                 skipped_frame++;
-                av_frame_unref(frame_ctx.frame);
+                av_frame_free(&frame_ctx.frame);
             }
 
         } else {
             // remux this frame without reencoding
+            av_frame_free(&frame_ctx.frame);
             for (int j = 0; j < nb_multi_output; j++) {
                 av_packet_rescale_ts(&packet,
                                      ifmt_ctx->streams[i]->time_base,
                                      ofmt_ctxs[j]->streams[i]->time_base);
 
-                ret = av_interleaved_write_frame(ofmt_ctxs[j], &packet);
+                //ret = av_interleaved_write_frame(ofmt_ctxs[j], &packet);
+                ret =0 ;
             }
             if (ret < 0)
                 goto end;
