@@ -71,6 +71,31 @@ typedef struct FilteringContext {
 } FilteringContext;
 static FilteringContext *filter_ctx;
 
+//config multi_threads
+#define BUF_SIZE 5
+
+static AVFrame *waited_frm[BUF_SIZE];
+static int ref_count[BUF_SIZE];
+static pthread_cond_t process_cond;
+static pthread_mutex_t process_mutex;
+static int t_end; //todo
+static int t_error; //todo
+
+typedef struct ProducerContext {
+    int prod_tail;
+    AVFrame *input_frm;
+    pthread_t f_thread;
+} ProducerContext;
+static ProducerContext *prod_ctx;
+
+typedef struct ConsumerContext {
+    int cons_head;
+    AVFrame *decoded_frame;
+    AVFrame *filtered_frame;
+    pthread_t f_thread;
+} ConsumerContext;
+static ConsumerContext *cons_ctxs;
+
 
 static int parse_options(int argc, char **argv){
     int ret = 0;
@@ -516,6 +541,59 @@ static int init_filters(void) {
     return 0;
 }
 
+static int init_threads(void) {
+    int ret = 0;
+
+    pthread_mutex_init(&process_mutex, NULL);
+    pthread_cond_init(&process_cond, NULL);
+    t_end = 0;
+    t_error = 0;
+
+    prod_ctx = (ProducerContext *) malloc(sizeof(ProducerContext));
+    if (prod_ctx == NULL) {
+        av_log(NULL, AV_LOG_ERROR, "producer_ctx malloc failed\n");
+        return -1;
+    }
+    prod_ctx->input_frm = av_frame_alloc();
+    if (!prod_ctx->input_frm) {
+        av_log(NULL, AV_LOG_ERROR, "producer_ctx->input_frm malloc failed\n");
+        ret = AVERROR(ENOMEM);
+        return ret;
+    }
+    prod_ctx->f_thread = 0;
+    prod_ctx->prod_tail = 0;
+
+
+    int N_consumer_ctx = nb_multi_output * ifmt_ctx->nb_streams;
+    cons_ctxs = (ConsumerContext *) malloc(N_consumer_ctx * sizeof(ConsumerContext));
+    if (cons_ctxs == NULL) {
+        av_log(NULL, AV_LOG_ERROR, "cons_ctxs malloc failed\n");
+        return -1;
+    }
+
+    for (int i = 0; i < ifmt_ctx->nb_streams; i++) {
+        for (int j = 0; j < nb_multi_output; j++) {
+            int id = i * nb_multi_output + j;
+            cons_ctxs[id].decoded_frame = av_frame_alloc();
+            if (!cons_ctxs[id].decoded_frame) {
+                av_log(NULL, AV_LOG_ERROR, "cons_ctxs[i].decoded_frame failed\n");
+                ret = AVERROR(ENOMEM);
+                return ret;
+            }
+            cons_ctxs[id].filtered_frame = av_frame_alloc();
+            if (!cons_ctxs[id].filtered_frame) {
+                av_log(NULL, AV_LOG_ERROR, "cons_ctxs[i].filtered_frame failed\n");
+                ret = AVERROR(ENOMEM);
+                return ret;
+            }
+            cons_ctxs[id].f_thread = 0;
+            cons_ctxs[id].cons_head = 0;
+        }
+    }
+    return ret;
+}
+
+
 int main(int argc, char **argv) {
     int ret = 0;
 
@@ -545,8 +623,30 @@ int main(int argc, char **argv) {
     if ((ret = init_filters()) < 0)
         goto end;
 
+    if((ret = init_threads() < 0))
+        goto end;
 
     end:
+    //free threads context
+    if(prod_ctx->input_frm){
+        av_frame_free(&prod_ctx->input_frm);
+    }
+
+    if(ifmt_ctx->nb_streams && filter_ctx) {
+        for (int i = 0; i < ifmt_ctx->nb_streams; i++) {
+            for (int j = 0; j < nb_multi_output; j++) {
+                int id = i * nb_multi_output + j;
+                if (cons_ctxs[id].decoded_frame){
+                    av_frame_free(&cons_ctxs[id].decoded_frame);
+                }
+                if (cons_ctxs[id].filtered_frame){
+                    av_frame_free(&cons_ctxs[id].filtered_frame);
+                }
+            }
+        }
+    }
+
+
     //free filter context
     if(ifmt_ctx->nb_streams && filter_ctx) {
         for (int i = 0; i < ifmt_ctx->nb_streams; i++) {
@@ -608,11 +708,5 @@ int main(int argc, char **argv) {
     if(opts_ctxs){
         free(opts_ctxs);
     }
-
-
-
-
-
-
     return ret;
 }
