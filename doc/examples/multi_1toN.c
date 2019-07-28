@@ -73,18 +73,18 @@ typedef struct FilteringContext {
 static FilteringContext *filter_ctxs;
 
 //config multi_threads
-#define BUF_SIZE 5
+#define BUF_SIZE 20
 
 static AVFrame *waited_frm[BUF_SIZE];
 static int ref_count[BUF_SIZE];
+static int buf_head;
+static int buf_tail;
 static pthread_cond_t process_cond;
 static pthread_mutex_t process_mutex;
 static int t_end; //todo
 static int t_error; //todo
 
 typedef struct ProducerContext {
-    int prod_tail;
-    AVFrame *input_frm;
     pthread_t f_thread;
 } ProducerContext;
 static ProducerContext *prod_ctx;
@@ -435,24 +435,28 @@ static int init_filters(void) {
 static int init_threads(void) {
     int ret = 0;
 
+    buf_head = 0;
+    buf_tail = 0;
     pthread_mutex_init(&process_mutex, NULL);
     pthread_cond_init(&process_cond, NULL);
     t_end = 0;
     t_error = 0;
+
+    for(int i = 0; i < BUF_SIZE; i++){
+        waited_frm[i] = av_frame_alloc();
+        if (!waited_frm[i]) {
+            av_log(NULL, AV_LOG_ERROR, "waited_frm[i] malloc failed\n");
+            ret = AVERROR(ENOMEM);
+            return ret;
+        }
+    }
 
     prod_ctx = (ProducerContext *) malloc(sizeof(ProducerContext));
     if (prod_ctx == NULL) {
         av_log(NULL, AV_LOG_ERROR, "producer_ctx malloc failed\n");
         return -1;
     }
-    prod_ctx->input_frm = av_frame_alloc();
-    if (!prod_ctx->input_frm) {
-        av_log(NULL, AV_LOG_ERROR, "producer_ctx->input_frm malloc failed\n");
-        ret = AVERROR(ENOMEM);
-        return ret;
-    }
     prod_ctx->f_thread = 0;
-    prod_ctx->prod_tail = 0;
 
     cons_ctxs = (ConsumerContext *) malloc(nb_multi_output * sizeof(ConsumerContext));
     if (cons_ctxs == NULL) {
@@ -480,6 +484,77 @@ static int init_threads(void) {
 }
 
 static void *producer_pipeline(void *arg) {
+    int got_frame = 0;
+    int skipped_frame = 0;
+    AVPacket packet = {.data = NULL, .size = 0};
+    int ret = 0;
+    AVFrame *frame = av_frame_alloc();
+    if (!frame) {
+        ret = AVERROR(ENOMEM);
+        t_error = -1;
+        return;
+    }
+    // read all packets
+    while (1) {
+        if (t_error || t_end) {
+            break;
+        }
+        if ((ret = av_read_frame(ifmt_ctx, &packet)) < 0)
+            break;
+
+        if (packet.stream_index == video_stream_index) {
+
+            av_packet_rescale_ts(&packet,
+                                 ifmt_ctx->streams[video_stream_index]->time_base,
+                                 dec_ctx->time_base);
+
+            ret = avcodec_decode_video2(dec_ctx, frame, &got_frame, &packet);
+            if (ret < 0) {
+                av_log(NULL, AV_LOG_ERROR, "Decoding failed\n");
+                t_error = ret;
+                break;
+            }
+
+            if (got_frame) {
+                frame->pts = frame->best_effort_timestamp;
+                pthread_mutex_lock(&process_mutex);
+                while (buf_head == (buf_tail + 1) % BUF_SIZE) {
+                    pthread_cond_wait(&process_cond, &process_mutex);
+                }
+                av_frame_ref(waited_frm[buf_tail], frame);
+                ref_count[buf_tail] = nb_multi_output;
+                buf_tail = (buf_tail + 1) % BUF_SIZE;
+                pthread_mutex_unlock(&process_mutex);
+                av_frame_unref(frame); //todo: check if needed
+            } else {
+                skipped_frame++;
+            }
+            av_packet_unref(&packet);
+        }
+    }
+    //flush decoder
+    for (int i = skipped_frame; i > 0; i--) {
+        ret = avcodec_decode_video2(dec_ctx, frame, &got_frame, &packet);
+        if (ret < 0) {
+            av_log(NULL, AV_LOG_ERROR, "Decoding failed\n");
+            t_error = ret;
+            break;
+        }
+        if (got_frame) {
+            frame->pts = frame->best_effort_timestamp;
+            pthread_mutex_lock(&process_mutex);
+            while (buf_head == (buf_tail + 1) % BUF_SIZE) {
+                pthread_cond_wait(&process_cond, &process_mutex);
+            }
+            av_frame_ref(waited_frm[buf_tail], frame);
+            ref_count[buf_tail] = nb_multi_output;
+            buf_tail = (buf_tail + 1) % BUF_SIZE;
+            pthread_mutex_unlock(&process_mutex);
+            //ret = filter_encode_write_frame(&frame_ctx);
+            av_frame_unref(frame); //todo: check if needed
+        }
+    }
+    av_frame_free(&frame);
     return;
 }
 
@@ -539,8 +614,10 @@ int main(int argc, char **argv) {
 
     end:
     //free threads context
-    if (prod_ctx->input_frm) {
-        av_frame_free(&prod_ctx->input_frm);
+    for(int i = 0; i < BUF_SIZE; i++){
+        if(waited_frm[i]) {
+            av_frame_free(&waited_frm[i]);
+        }
     }
 
     for (int id = 0; id < nb_multi_output; id++) {
