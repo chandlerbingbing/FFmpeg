@@ -220,7 +220,6 @@ static int open_input_file(void)
     return 0;
 }
 
-
 static int init_output_file(void) {
     AVStream *out_stream;
     AVStream *in_stream;
@@ -281,12 +280,12 @@ static int init_output_file(void) {
         /* Third parameter can be used to pass settings to encoder */
         ret = avcodec_open2(enc_ctx, encoder, &opts_ctxs[j].enc_opts);
         if (ret < 0) {
-            av_log(NULL, AV_LOG_ERROR, "Cannot open video encoder for stream #%u\n", i);
+            av_log(NULL, AV_LOG_ERROR, "Cannot open video encoder for stream #%u\n", video_stream_index);
             return ret;
         }
         ret = avcodec_parameters_from_context(out_stream->codecpar, enc_ctx);
         if (ret < 0) {
-            av_log(NULL, AV_LOG_ERROR, "Failed to copy encoder parameters to output stream #%u\n", i);
+            av_log(NULL, AV_LOG_ERROR, "Failed to copy encoder parameters to output stream #%u\n", video_stream_index);
             return ret;
         }
 
@@ -480,6 +479,13 @@ static int init_threads(void) {
     return ret;
 }
 
+static void *producer_pipeline(void *arg) {
+    return;
+}
+
+static void *consumer_pipeline(void *arg) {
+    return;
+}
 
 int main(int argc, char **argv) {
     int ret = 0;
@@ -513,6 +519,23 @@ int main(int argc, char **argv) {
 
     if ((ret = init_threads() < 0))
         goto end;
+
+    if((ret = pthread_create(&prod_ctx->f_thread, NULL, producer_pipeline, NULL))) {
+        av_log(NULL, AV_LOG_ERROR, "prod_ctx pthread_create failed: %s.\n", strerror(ret));
+        goto end;
+    }
+
+    for (int id = 0; id < nb_multi_output; id++) {
+        if ((ret = pthread_create(&cons_ctxs[id].f_thread, NULL, consumer_pipeline, &filter_ctxs[id]))) {
+            av_log(NULL, AV_LOG_ERROR, "cons_ctxs pthread_create failed: %s.\n", strerror(ret));
+            goto end;
+        }
+    }
+
+    pthread_join(prod_ctx->f_thread, NULL);
+    for(int id = 0; id<nb_multi_output;id++) {
+        pthread_join(cons_ctxs[id].f_thread, NULL);
+    }
 
     end:
     //free threads context
@@ -578,5 +601,5 @@ int main(int argc, char **argv) {
     if (opts_ctxs) {
         free(opts_ctxs);
     }
-    return ret;
+    return 0;
 }
