@@ -67,13 +67,12 @@ typedef struct FilteringContext {
     AVFilterContext *buffersink_ctx;
     AVFilterContext *buffersrc_ctx;
     AVFilterGraph *filter_graph;
-    unsigned int i;
-    unsigned int j;
+    unsigned int filter_id;
 } FilteringContext;
 static FilteringContext *filter_ctxs;
 
 //config multi_threads
-#define BUF_SIZE 20
+#define BUF_SIZE 5
 
 static AVFrame *waited_frm[BUF_SIZE];
 static int ref_count[BUF_SIZE];
@@ -96,7 +95,6 @@ typedef struct ConsumerContext {
     pthread_t f_thread;
 } ConsumerContext;
 static ConsumerContext *cons_ctxs;
-
 
 static int parse_options(int argc, char **argv){
     int ret = 0;
@@ -419,6 +417,7 @@ static int init_filters(void) {
         return AVERROR(ENOMEM);
 
     for (id = 0; id < nb_multi_output; id++) {
+        filter_ctxs[id].filter_id = id;
         filter_ctxs[id].buffersrc_ctx = NULL;
         filter_ctxs[id].buffersink_ctx = NULL;
         filter_ctxs[id].filter_graph = NULL;
@@ -443,6 +442,7 @@ static int init_threads(void) {
     t_error = 0;
 
     for(int i = 0; i < BUF_SIZE; i++){
+        ref_count[i] = 0;
         waited_frm[i] = av_frame_alloc();
         if (!waited_frm[i]) {
             av_log(NULL, AV_LOG_ERROR, "waited_frm[i] malloc failed\n");
@@ -483,6 +483,39 @@ static int init_threads(void) {
     return ret;
 }
 
+
+static int encode_write_frame(AVFrame *filt_frame, int id, int *got_frame) {
+    int ret;
+    AVPacket enc_pkt;
+
+    int got_frame_local;
+    if (!got_frame)
+        got_frame = &got_frame_local;
+
+    /* encode filtered frame */
+    enc_pkt.data = NULL;
+    enc_pkt.size = 0;
+    av_init_packet(&enc_pkt);
+    ret = avcodec_encode_video2(enc_ctxs[id], &enc_pkt, filt_frame, got_frame);
+    av_frame_unref(filt_frame);
+    if (ret < 0)
+        return ret;
+
+    if (!(*got_frame))
+        return 0;
+
+    /* prepare packet for muxing */
+    enc_pkt.stream_index = video_stream_index;
+    av_packet_rescale_ts(&enc_pkt,
+                         enc_ctxs[id]->time_base,
+                         ofmt_ctxs[id]->streams[video_stream_index]->time_base);
+
+    av_log(NULL, AV_LOG_DEBUG, "Muxing frame\n");
+    /* mux encoded frame */
+    ret = av_interleaved_write_frame(ofmt_ctxs[id], &enc_pkt);
+    return ret;
+}
+
 static void *producer_pipeline(void *arg) {
     int got_frame = 0;
     int skipped_frame = 0;
@@ -494,6 +527,7 @@ static void *producer_pipeline(void *arg) {
         t_error = -1;
         return;
     }
+    int count_frame = 0;
     // read all packets
     while (1) {
         if (t_error || t_end) {
@@ -522,10 +556,11 @@ static void *producer_pipeline(void *arg) {
                     pthread_cond_wait(&process_cond, &process_mutex);
                 }
                 av_frame_ref(waited_frm[buf_tail], frame);
-                ref_count[buf_tail] = nb_multi_output;
                 buf_tail = (buf_tail + 1) % BUF_SIZE;
+                pthread_cond_signal(&process_cond);
                 pthread_mutex_unlock(&process_mutex);
-                av_frame_unref(frame); //todo: check if needed
+                av_log(NULL, AV_LOG_INFO, "produce frame:%d\n", count_frame++);
+                av_frame_unref(frame);
             } else {
                 skipped_frame++;
             }
@@ -547,11 +582,11 @@ static void *producer_pipeline(void *arg) {
                 pthread_cond_wait(&process_cond, &process_mutex);
             }
             av_frame_ref(waited_frm[buf_tail], frame);
-            ref_count[buf_tail] = nb_multi_output;
             buf_tail = (buf_tail + 1) % BUF_SIZE;
+            pthread_cond_signal(&process_cond);
             pthread_mutex_unlock(&process_mutex);
-            //ret = filter_encode_write_frame(&frame_ctx);
-            av_frame_unref(frame); //todo: check if needed
+            av_log(NULL, AV_LOG_INFO, "produce frame:%d\n", count_frame++);
+            av_frame_unref(frame);
         }
     }
     av_frame_free(&frame);
@@ -559,7 +594,123 @@ static void *producer_pipeline(void *arg) {
 }
 
 static void *consumer_pipeline(void *arg) {
+    FilteringContext *fl = arg;
+    int id = fl->filter_id;
+    int ret;
+    int count_frame = 0;
+    while (1) {
+        pthread_mutex_lock(&process_mutex);
+        int c_head = cons_ctxs[id].cons_head;
+        while (c_head == buf_tail && !t_end) //wait if the buffer is empty
+            pthread_cond_wait(&process_cond, &process_mutex);
+
+        if(waited_frm[c_head]->buf[0] == NULL) {
+            if(t_end) {
+                av_log(NULL, AV_LOG_INFO, "pthread:%d: The end of consumer_pipeline\n", id);
+            } else {
+                av_log(NULL, AV_LOG_ERROR, "pthread:%d: consumer_pipeline: waited_frm is NULL\n", id);
+            }
+            pthread_cond_signal(&process_cond);
+            pthread_mutex_unlock(&process_mutex);
+            break;
+        }
+
+        av_frame_ref(cons_ctxs[id].decoded_frame, waited_frm[c_head]);
+        ref_count[c_head]++;
+        if (ref_count[c_head] == nb_multi_output) {
+            av_frame_unref(waited_frm[c_head]);
+            buf_head = (c_head + 1) % BUF_SIZE;
+            ref_count[c_head] = 0;
+        }
+        cons_ctxs[id].cons_head = (c_head + 1) % BUF_SIZE;
+        pthread_cond_signal(&process_cond);
+        pthread_mutex_unlock(&process_mutex);
+
+        av_log(NULL, AV_LOG_INFO, "pthread:%d: consumer frame:%d\n", id, count_frame++);
+
+        //start filter frame
+        ret = av_buffersrc_add_frame_flags(fl->buffersrc_ctx, cons_ctxs[id].decoded_frame, 0);
+        if (ret < 0) {
+            av_log(NULL, AV_LOG_ERROR, "pthread:%d: Error while feeding the filtergraph\n", id);
+            t_error = ret;
+            break;
+        }
+        while (1) {
+            ret = av_buffersink_get_frame(fl->buffersink_ctx, cons_ctxs[id].filtered_frame);
+            if (ret < 0) {
+                /* if no more frames for output - returns AVERROR(EAGAIN)
+                 * if flushed and no more frames for output - returns AVERROR_EOF
+                 * rewrite retcode to 0 to show it as normal procedure completion
+                 */
+                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+                    ret = 0;
+                } else {
+                    av_log(NULL, AV_LOG_ERROR, "pthread:%d: Error while av_buffersink_get_frame\n", id);
+                    t_error = ret;
+                }
+                break;
+            }
+            cons_ctxs[id].filtered_frame->pict_type = AV_PICTURE_TYPE_NONE;
+            ret = encode_write_frame(cons_ctxs[id].filtered_frame, id, NULL);
+            if (ret < 0){
+                av_log(NULL, AV_LOG_ERROR, "pthread:%d: Error while encode_write_frame\n", id);
+                t_error = ret;
+                break;
+            }
+        }
+    }
     return;
+}
+
+static int flush_filter(int id) {
+    int ret;
+    ret = av_buffersrc_add_frame_flags(filter_ctxs[id].buffersrc_ctx, NULL, 0);
+    if (ret < 0) {
+        av_log(NULL, AV_LOG_ERROR, "Error while flush the filtergraph [%d]\n", id);
+        return ret;
+    }
+
+    while (1) {
+        ret = av_buffersink_get_frame(filter_ctxs[id].buffersink_ctx, cons_ctxs[id].filtered_frame);
+        if (ret < 0) {
+            /* if no more frames for output - returns AVERROR(EAGAIN)
+             * if flushed and no more frames for output - returns AVERROR_EOF
+             * rewrite retcode to 0 to show it as normal procedure completion
+             */
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+                ret = 0;
+            } else {
+                av_log(NULL, AV_LOG_ERROR, "Error while av_buffersink_get_frame\n");
+            }
+            break;
+        }
+        cons_ctxs[id].filtered_frame->pict_type = AV_PICTURE_TYPE_NONE;
+        ret = encode_write_frame(cons_ctxs[id].filtered_frame, id, NULL);
+        if (ret < 0) {
+            av_log(NULL, AV_LOG_ERROR, "Error while encode_write_frame\n");
+            break;
+        }
+    }
+    return ret;
+}
+
+static int flush_encoder(int id) {
+    int ret;
+    int got_frame;
+
+    if (!(enc_ctxs[id]->codec->capabilities & AV_CODEC_CAP_DELAY))
+        return 0;
+
+    while (1) {
+        av_log(NULL, AV_LOG_INFO, "Flushing stream #%u encoder\n", id);
+        ret = encode_write_frame(NULL, id, &got_frame);
+        if (ret < 0)
+            break;
+        if (!got_frame)
+            return 0;
+    }
+
+    return ret;
 }
 
 int main(int argc, char **argv) {
@@ -586,14 +737,20 @@ int main(int argc, char **argv) {
         goto end;
     }
 
-    if ((ret = init_output_file()) < 0)
+    if ((ret = init_output_file()) < 0) {
+        av_log(NULL, AV_LOG_ERROR, "initialize output file failed\n");
         goto end;
+    }
 
-    if ((ret = init_filters()) < 0)
+    if ((ret = init_filters()) < 0) {
+        av_log(NULL, AV_LOG_ERROR, "initialize filters failed\n");
         goto end;
+    }
 
-    if ((ret = init_threads() < 0))
+    if ((ret = init_threads() < 0)) {
+        av_log(NULL, AV_LOG_ERROR, "initialize threads failed\n");
         goto end;
+    }
 
     if((ret = pthread_create(&prod_ctx->f_thread, NULL, producer_pipeline, NULL))) {
         av_log(NULL, AV_LOG_ERROR, "prod_ctx pthread_create failed: %s.\n", strerror(ret));
@@ -608,8 +765,32 @@ int main(int argc, char **argv) {
     }
 
     pthread_join(prod_ctx->f_thread, NULL);
+
+    //send t_end signal to consumer_pipelines
+    pthread_mutex_lock(&process_mutex);
+    t_end = 1;
+    pthread_cond_signal(&process_cond);
+    pthread_mutex_unlock(&process_mutex);
+
     for(int id = 0; id<nb_multi_output;id++) {
         pthread_join(cons_ctxs[id].f_thread, NULL);
+    }
+
+    //flush filters and encoders
+    for (int id = 0; id < nb_multi_output; id++) {
+        if ((ret = flush_filter(id) < 0)) {
+            av_log(NULL, AV_LOG_ERROR, "flush filters failed\n");
+            goto end;
+        }
+        if ((ret = flush_encoder(id) < 0)) {
+            av_log(NULL, AV_LOG_ERROR, "flush encoders failed\n");
+            goto end;
+        }
+    }
+
+    //write trailer
+    for (int id = 0; id < nb_multi_output; id++) {
+        av_write_trailer(ofmt_ctxs[id]);
     }
 
     end:
@@ -645,7 +826,8 @@ int main(int argc, char **argv) {
 
     //free output context
     for (int id = 0; id < nb_multi_output; id++) {
-        if (enc_ctxs[id]) {
+        if (ofmt_ctxs[id] && ofmt_ctxs[id]->nb_streams > video_stream_index
+        && ofmt_ctxs[id]->streams[video_stream_index] && enc_ctxs[id]) {
             avcodec_free_context(&enc_ctxs[id]);
         }
     }
