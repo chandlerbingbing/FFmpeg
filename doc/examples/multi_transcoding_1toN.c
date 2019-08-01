@@ -39,6 +39,12 @@
 #include <libavutil/time.h>
 #include <unistd.h>
 
+//fps test
+static int64_t time_begin = 0;
+static int64_t time_duration = 0;
+static int frame_total = 0;
+static int test_performance = 1;
+
 //config parse options
 static int nb_multi_output = 1;
 static char *nb_decode_threads;
@@ -81,8 +87,8 @@ static int buf_head;
 static int buf_tail;
 static pthread_cond_t process_cond;
 static pthread_mutex_t process_mutex;
-static int t_end; //todo
-static int t_error; //todo
+static int t_end;
+static int t_error;
 
 typedef struct ProducerContext {
     pthread_t f_thread;
@@ -522,7 +528,11 @@ static int encode_write_frame(AVFrame *filt_frame, int id, int *got_frame) {
 
     av_log(NULL, AV_LOG_DEBUG, "Muxing frame\n");
     /* mux encoded frame */
-    ret = av_interleaved_write_frame(ofmt_ctxs[id], &enc_pkt);
+    if(!test_performance) {
+        ret = av_interleaved_write_frame(ofmt_ctxs[id], &enc_pkt);
+    } else {
+        ret = 0;
+    }
     return ret;
 }
 
@@ -569,7 +579,8 @@ static void *producer_pipeline(void *arg) {
                 buf_tail = (buf_tail + 1) % BUF_SIZE;
                 pthread_cond_signal(&process_cond);
                 pthread_mutex_unlock(&process_mutex);
-                av_log(NULL, AV_LOG_INFO, "produce frame:%d\n", count_frame++);
+                if(!test_performance)
+                    av_log(NULL, AV_LOG_INFO, "produce frame:%d\r", count_frame++);
                 av_frame_unref(frame);
             } else {
                 skipped_frame++;
@@ -595,7 +606,7 @@ static void *producer_pipeline(void *arg) {
             buf_tail = (buf_tail + 1) % BUF_SIZE;
             pthread_cond_signal(&process_cond);
             pthread_mutex_unlock(&process_mutex);
-            av_log(NULL, AV_LOG_INFO, "produce frame:%d\n", count_frame++);
+            av_log(NULL, AV_LOG_DEBUG, "produce frame:%d\n", count_frame++);
             av_frame_unref(frame);
         }
     }
@@ -616,7 +627,7 @@ static void *consumer_pipeline(void *arg) {
 
         if(waited_frm[c_head]->buf[0] == NULL) {
             if(t_end) {
-                av_log(NULL, AV_LOG_INFO, "pthread:%d: The end of consumer_pipeline\n", id);
+                av_log(NULL, AV_LOG_DEBUG, "pthread:%d: The end of consumer_pipeline\n", id);
             } else {
                 av_log(NULL, AV_LOG_ERROR, "pthread:%d: consumer_pipeline: waited_frm is NULL\n", id);
             }
@@ -631,12 +642,17 @@ static void *consumer_pipeline(void *arg) {
             av_frame_unref(waited_frm[c_head]);
             buf_head = (c_head + 1) % BUF_SIZE;
             ref_count[c_head] = 0;
+            if(test_performance) {
+                time_duration = av_gettime() - time_begin;
+                av_log(NULL, AV_LOG_INFO, "frame:%d, fps:%.2f\r", frame_total,
+                       frame_total++ / (time_duration / 1000000.0));
+            }
         }
         cons_ctxs[id].cons_head = (c_head + 1) % BUF_SIZE;
         pthread_cond_signal(&process_cond);
         pthread_mutex_unlock(&process_mutex);
 
-        av_log(NULL, AV_LOG_INFO, "pthread:%d: consumer frame:%d\n", id, count_frame++);
+        av_log(NULL, AV_LOG_DEBUG, "pthread:%d: consumer frame:%d\n", id, count_frame++);
 
         //start filter frame
         ret = av_buffersrc_add_frame_flags(fl->buffersrc_ctx, cons_ctxs[id].decoded_frame, 0);
@@ -711,8 +727,8 @@ static int flush_encoder(int id) {
     if (!(enc_ctxs[id]->codec->capabilities & AV_CODEC_CAP_DELAY))
         return 0;
 
+    av_log(NULL, AV_LOG_INFO, "Flushing stream #%u encoder\n", id);
     while (1) {
-        av_log(NULL, AV_LOG_INFO, "Flushing stream #%u encoder\n", id);
         ret = encode_write_frame(NULL, id, &got_frame);
         if (ret < 0)
             break;
@@ -725,7 +741,6 @@ static int flush_encoder(int id) {
 
 int main(int argc, char **argv) {
     int ret = 0;
-    int64_t time_begin,time_end;
 
     if (strcmp(argv[1], "-help") == 0) {
         av_log(NULL, AV_LOG_ERROR, "Usage: %s -i <input file> \ \n "
@@ -763,7 +778,10 @@ int main(int argc, char **argv) {
         goto end;
     }
 
-    time_begin = av_gettime();
+    if(test_performance) {
+        time_begin = av_gettime();
+    }
+
     if((ret = pthread_create(&prod_ctx->f_thread, NULL, producer_pipeline, NULL))) {
         av_log(NULL, AV_LOG_ERROR, "prod_ctx pthread_create failed: %s.\n", strerror(ret));
         goto end;
@@ -800,8 +818,10 @@ int main(int argc, char **argv) {
         }
     }
 
-    time_end = av_gettime();
-    av_log(NULL, AV_LOG_INFO, "time %ld milliseconds\n", (time_end-time_begin)/1000);
+    if(test_performance) {
+        time_duration = av_gettime() - time_begin;
+        av_log(NULL, AV_LOG_INFO, "frame:%d, fps:%.2f", frame_total, frame_total / (time_duration / 1000000.0));
+    }
 
     //write trailer
     for (int id = 0; id < nb_multi_output; id++) {
