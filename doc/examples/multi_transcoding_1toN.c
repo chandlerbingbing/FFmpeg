@@ -41,6 +41,7 @@
 
 //config parse options
 static int nb_multi_output = 1;
+static char *nb_decode_threads;
 static char *input_file;
 typedef struct OptionParserContext {
     char *enc_lib;
@@ -72,7 +73,8 @@ typedef struct FilteringContext {
 static FilteringContext *filter_ctxs;
 
 //config multi_threads
-#define BUF_SIZE 5
+#define BUF_SIZE 50
+
 
 static AVFrame *waited_frm[BUF_SIZE];
 static int ref_count[BUF_SIZE];
@@ -100,7 +102,7 @@ static int parse_options(int argc, char **argv){
     int ret = 0;
 
     if (argc < 3) {
-        av_log(NULL, AV_LOG_ERROR, "Usage: %s -i <input file> -nb_outputs 4 \ \n"
+        av_log(NULL, AV_LOG_ERROR, "Usage: %s -i <input file> -nb_outputs 4 -nb_decode_threads 72\ \n"
                                    "-c:v libsvt_hevc -vf scale=7680:3840 -rc 1 -b:v 13M -g 60 -tune 1 -preset 6 -o o1.mp4 \ \n"
                                    "-c:v libsvt_hevc -vf scale=1920:1080 -rc 1 -b:v 4.5M -g 60 -tune 1 -preset 6 -o o2.mp4 \ \n"
                                    "-c:v libsvt_hevc -vf scale=1280:720 -rc 1 -b:v 2M   -g 60 -tune 1 -preset 6 -o o3.mp4 \ \n"
@@ -148,6 +150,8 @@ static int parse_options(int argc, char **argv){
             strtok(vf_arg,"=");
             opts_ctxs[j].width = atoi(strtok(NULL, ":"));
             opts_ctxs[j].height = atoi(strtok(NULL, ":"));
+        } else if (strcmp(argv[i], "-nb_decode_threads") == 0) {
+            nb_decode_threads = argv[i + 1];
         } else if (strcmp(argv[i], "-rc") == 0) {
             av_dict_set(&opts_ctxs[j].enc_opts,"rc","1", 0);
         } else if (strcmp(argv[i], "-g") == 0) {
@@ -205,7 +209,14 @@ static int open_input_file(void)
     }
     dec_ctx->framerate = av_guess_frame_rate(ifmt_ctx, stream, NULL);
     AVDictionary *dec_opt = NULL;
-    //av_dict_set(&dec_opt,"threads","1", 0);
+
+    if(nb_decode_threads) {
+        av_dict_set(&dec_opt, "threads", nb_decode_threads, 0);
+    } else {
+        char max_cpu_threads[10];
+        sprintf(max_cpu_threads, "%d", av_cpu_count());
+        av_dict_set(&dec_opt, "threads", max_cpu_threads, 0);
+    }
     av_dict_set(&dec_opt, "refcounted_frames", "1", 0);
 
     ret = avcodec_open2(dec_ctx, dec, &dec_opt);
@@ -715,10 +726,11 @@ static int flush_encoder(int id) {
 
 int main(int argc, char **argv) {
     int ret = 0;
+    int64_t time_begin,time_end;
 
     if (strcmp(argv[1], "-help") == 0) {
         av_log(NULL, AV_LOG_ERROR, "Usage: %s -i <input file> \ \n "
-                                   "-nb_outputs 4 \ \n"
+                                   "-nb_outputs 4 -nb_decode_threads 72 \ \n"
                                    "-c:v libsvt_hevc -vf scale=7680:3840 -rc 1 -b:v 13M -g 60 -tune 1 -preset 6 -o o1.mp4 \ \n"
                                    "-c:v libsvt_hevc -vf scale=1920:1080 -rc 1 -b:v 4.5M -g 60 -tune 1 -preset 6 -o o2.mp4 \ \n"
                                    "-c:v libsvt_hevc -vf scale=1280:720 -rc 1 -b:v 2M   -g 60 -tune 1 -preset 6 -o o3.mp4 \ \n"
@@ -752,6 +764,7 @@ int main(int argc, char **argv) {
         goto end;
     }
 
+    time_begin = av_gettime();
     if((ret = pthread_create(&prod_ctx->f_thread, NULL, producer_pipeline, NULL))) {
         av_log(NULL, AV_LOG_ERROR, "prod_ctx pthread_create failed: %s.\n", strerror(ret));
         goto end;
@@ -787,6 +800,9 @@ int main(int argc, char **argv) {
             goto end;
         }
     }
+
+    time_end = av_gettime();
+    av_log(NULL, AV_LOG_INFO, "time %ld milliseconds\n", (time_end-time_begin)/1000);
 
     //write trailer
     for (int id = 0; id < nb_multi_output; id++) {
