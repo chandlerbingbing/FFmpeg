@@ -75,7 +75,6 @@ static FilteringContext *filter_ctxs;
 //config multi_threads
 #define BUF_SIZE 50
 
-
 static AVFrame *waited_frm[BUF_SIZE];
 static int ref_count[BUF_SIZE];
 static int buf_head;
