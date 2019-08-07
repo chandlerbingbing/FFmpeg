@@ -148,13 +148,12 @@ static int parse_options(int argc, char **argv){
     for(int i = 1;i < argc;i=i+2) {
         if (strcmp(argv[i], "-c:v") == 0) {
             opts_ctxs[j].enc_lib = argv[i + 1];
+        } else if (strcmp(argv[i], "-w") == 0) {
+            opts_ctxs[j].width = atoi(argv[i + 1]);
+        } else if (strcmp(argv[i], "-h") == 0) {
+            opts_ctxs[j].height = atoi(argv[i + 1]);
         } else if (strcmp(argv[i], "-vf") == 0) {
             opts_ctxs[j].filter_desc = argv[i + 1];
-            char vf_arg[20];
-            strcpy(vf_arg, argv[i+1]);
-            strtok(vf_arg,"=");
-            opts_ctxs[j].width = atoi(strtok(NULL, ":"));
-            opts_ctxs[j].height = atoi(strtok(NULL, ":"));
         } else if (strcmp(argv[i], "-nb_decode_threads") == 0) {
             nb_decode_threads = argv[i + 1];
         } else if (strcmp(argv[i], "-rc") == 0) {
