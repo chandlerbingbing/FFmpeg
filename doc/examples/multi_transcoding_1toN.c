@@ -80,6 +80,7 @@ static FilteringContext *filter_ctxs;
 
 //config multi_threads
 #define BUF_SIZE 50
+#define FILETER_FRAME_BUF_SIZE 120
 
 static AVFrame *waited_frm[BUF_SIZE];
 static int ref_count[BUF_SIZE];
@@ -95,10 +96,15 @@ typedef struct ProducerContext {
 } ProducerContext;
 static ProducerContext *prod_ctx;
 
+typedef struct filter_frame_tag{
+    AVFrame *filtered_frame;
+    int *unref_tag;
+}Filter_frame_tag;
+
 typedef struct ConsumerContext {
     int cons_head;
     AVFrame *decoded_frame;
-    AVFrame *filtered_frame;
+    Filter_frame_tag filtered_frame[FILETER_FRAME_BUF_SIZE];
     pthread_t f_thread;
 } ConsumerContext;
 static ConsumerContext *cons_ctxs;
@@ -486,11 +492,20 @@ static int init_threads(void) {
             ret = AVERROR(ENOMEM);
             return ret;
         }
-        cons_ctxs[id].filtered_frame = av_frame_alloc();
-        if (!cons_ctxs[id].filtered_frame) {
-            av_log(NULL, AV_LOG_ERROR, "cons_ctxs[i].filtered_frame failed\n");
-            ret = AVERROR(ENOMEM);
-            return ret;
+        for (int buf_id = 0; buf_id < FILETER_FRAME_BUF_SIZE; buf_id++){
+            cons_ctxs[id].filtered_frame[buf_id].filtered_frame = av_frame_alloc();
+            if (!cons_ctxs[id].filtered_frame[buf_id].filtered_frame) {
+                av_log(NULL, AV_LOG_ERROR, "cons_ctxs[i].svt_frame.filtered_frame failed\n");
+                ret = AVERROR(ENOMEM);
+                return ret;
+            }
+            cons_ctxs[id].filtered_frame[buf_id].unref_tag = (int *)malloc(sizeof(int));
+            if (!cons_ctxs[id].filtered_frame[buf_id].unref_tag) {
+                av_log(NULL, AV_LOG_ERROR, "cons_ctxs[i].svt_frame.filtered_frame failed\n");
+                ret = AVERROR(ENOMEM);
+                return ret;
+            }
+            *cons_ctxs[id].filtered_frame[buf_id].unref_tag = 0;
         }
         cons_ctxs[id].f_thread = 0;
         cons_ctxs[id].cons_head = 0;
@@ -499,7 +514,7 @@ static int init_threads(void) {
 }
 
 
-static int encode_write_frame(AVFrame *filt_frame, int id, int *got_frame) {
+static int encode_write_frame(AVFrame *filt_frame, int id, int *got_frame, int *svt_tag) {
     int ret;
     AVPacket enc_pkt;
 
@@ -511,8 +526,8 @@ static int encode_write_frame(AVFrame *filt_frame, int id, int *got_frame) {
     enc_pkt.data = NULL;
     enc_pkt.size = 0;
     av_init_packet(&enc_pkt);
-    ret = avcodec_encode_video2(enc_ctxs[id], &enc_pkt, filt_frame, got_frame);
-    av_frame_unref(filt_frame);
+    ret = avcodec_encode_video2(enc_ctxs[id], &enc_pkt, filt_frame, got_frame, svt_tag);
+    //av_frame_unref(filt_frame);
     if (ret < 0)
         return ret;
 
@@ -579,7 +594,7 @@ static void *producer_pipeline(void *arg) {
                 pthread_cond_signal(&process_cond);
                 pthread_mutex_unlock(&process_mutex);
                 if(!test_performance)
-                    av_log(NULL, AV_LOG_INFO, "produce frame:%d\r", count_frame++);
+                    av_log(NULL, AV_LOG_INFO, "produce frame:%d\n", count_frame++);
                 av_frame_unref(frame);
             } else {
                 skipped_frame++;
@@ -661,7 +676,22 @@ static void *consumer_pipeline(void *arg) {
             break;
         }
         while (1) {
-            ret = av_buffersink_get_frame(fl->buffersink_ctx, cons_ctxs[id].filtered_frame);
+            AVFrame *filtered_frame = NULL;
+            int *svt_tag = NULL;
+            for(int buf_id = 0; buf_id<FILETER_FRAME_BUF_SIZE;buf_id++){
+                if(*cons_ctxs[id].filtered_frame[buf_id].unref_tag == 0){
+                    filtered_frame = cons_ctxs[id].filtered_frame[buf_id].filtered_frame;
+                    svt_tag = cons_ctxs[id].filtered_frame[buf_id].unref_tag;
+                    break;
+                }else if(*cons_ctxs[id].filtered_frame[buf_id].unref_tag == 2){
+                    av_frame_unref(cons_ctxs[id].filtered_frame[buf_id].filtered_frame);
+                    *cons_ctxs[id].filtered_frame[buf_id].unref_tag = 0;
+                }
+            }
+            if(!filtered_frame) {
+                continue;
+            }
+            ret = av_buffersink_get_frame(fl->buffersink_ctx, filtered_frame);
             if (ret < 0) {
                 /* if no more frames for output - returns AVERROR(EAGAIN)
                  * if flushed and no more frames for output - returns AVERROR_EOF
@@ -675,8 +705,9 @@ static void *consumer_pipeline(void *arg) {
                 }
                 break;
             }
-            cons_ctxs[id].filtered_frame->pict_type = AV_PICTURE_TYPE_NONE;
-            ret = encode_write_frame(cons_ctxs[id].filtered_frame, id, NULL);
+            *svt_tag = 1;
+            filtered_frame->pict_type = AV_PICTURE_TYPE_NONE;
+            ret = encode_write_frame(filtered_frame, id, NULL, svt_tag);
             if (ret < 0){
                 av_log(NULL, AV_LOG_ERROR, "pthread:%d: Error while encode_write_frame\n", id);
                 t_error = ret;
@@ -696,7 +727,19 @@ static int flush_filter(int id) {
     }
 
     while (1) {
-        ret = av_buffersink_get_frame(filter_ctxs[id].buffersink_ctx, cons_ctxs[id].filtered_frame);
+        AVFrame *filtered_frame = NULL;
+        int *svt_tag = NULL;
+        for(int buf_id = 0; buf_id<FILETER_FRAME_BUF_SIZE;buf_id++){
+            if(*cons_ctxs[id].filtered_frame[buf_id].unref_tag == 0){
+                filtered_frame = cons_ctxs[id].filtered_frame[buf_id].filtered_frame;
+                svt_tag = cons_ctxs[id].filtered_frame[buf_id].unref_tag;
+                break;
+            }else if(*cons_ctxs[id].filtered_frame[buf_id].unref_tag == 2){
+                av_frame_unref(cons_ctxs[id].filtered_frame[buf_id].filtered_frame);
+                *cons_ctxs[id].filtered_frame[buf_id].unref_tag = 0;
+            }
+        }
+        ret = av_buffersink_get_frame(filter_ctxs[id].buffersink_ctx, filtered_frame);
         if (ret < 0) {
             /* if no more frames for output - returns AVERROR(EAGAIN)
              * if flushed and no more frames for output - returns AVERROR_EOF
@@ -709,8 +752,9 @@ static int flush_filter(int id) {
             }
             break;
         }
-        cons_ctxs[id].filtered_frame->pict_type = AV_PICTURE_TYPE_NONE;
-        ret = encode_write_frame(cons_ctxs[id].filtered_frame, id, NULL);
+        *svt_tag = 1;
+        filtered_frame->pict_type = AV_PICTURE_TYPE_NONE;
+        ret = encode_write_frame(filtered_frame, id, NULL, svt_tag);
         if (ret < 0) {
             av_log(NULL, AV_LOG_ERROR, "Error while encode_write_frame\n");
             break;
@@ -728,7 +772,7 @@ static int flush_encoder(int id) {
 
     av_log(NULL, AV_LOG_INFO, "Flushing stream #%u encoder\n", id);
     while (1) {
-        ret = encode_write_frame(NULL, id, &got_frame);
+        ret = encode_write_frame(NULL, id, &got_frame, NULL);
         if (ret < 0)
             break;
         if (!got_frame)
@@ -819,7 +863,8 @@ int main(int argc, char **argv) {
 
     if(test_performance) {
         time_duration = av_gettime() - time_begin;
-        av_log(NULL, AV_LOG_INFO, "frame:%d, fps:%.2f", frame_total, frame_total / (time_duration / 1000000.0));
+        av_log(NULL, AV_LOG_INFO, "frame:%d, fps:%.2f\n", frame_total, frame_total / (time_duration / 1000000.0));
+        av_log(NULL, AV_LOG_INFO, "time is %ld\n", time_duration);
     }
 
     //write trailer
@@ -839,8 +884,11 @@ int main(int argc, char **argv) {
         if (cons_ctxs[id].decoded_frame) {
             av_frame_free(&cons_ctxs[id].decoded_frame);
         }
-        if (cons_ctxs[id].filtered_frame) {
-            av_frame_free(&cons_ctxs[id].filtered_frame);
+        for (int buf_id = 0; buf_id < FILETER_FRAME_BUF_SIZE; ++buf_id) {
+            if (cons_ctxs[id].filtered_frame[buf_id].filtered_frame) {
+                av_frame_free(&(cons_ctxs[id].filtered_frame[buf_id].filtered_frame));
+                free(cons_ctxs[id].filtered_frame[buf_id].unref_tag);
+            }
         }
     }
 
@@ -861,7 +909,7 @@ int main(int argc, char **argv) {
     //free output context
     for (int id = 0; id < nb_multi_output; id++) {
         if (ofmt_ctxs[id] && ofmt_ctxs[id]->nb_streams > video_stream_index
-        && ofmt_ctxs[id]->streams[video_stream_index] && enc_ctxs[id]) {
+            && ofmt_ctxs[id]->streams[video_stream_index] && enc_ctxs[id]) {
             avcodec_free_context(&enc_ctxs[id]);
         }
     }

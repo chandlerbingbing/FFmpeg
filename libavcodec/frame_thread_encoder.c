@@ -86,7 +86,7 @@ static void * attribute_align_arg worker(void *v){
         pthread_mutex_unlock(&c->task_fifo_mutex);
         frame = task.indata;
 
-        ret = avcodec_encode_video2(avctx, pkt, frame, &got_packet);
+        ret = avcodec_encode_video2(avctx, pkt, frame, &got_packet, NULL);
         pthread_mutex_lock(&c->buffer_mutex);
         av_frame_unref(frame);
         pthread_mutex_unlock(&c->buffer_mutex);

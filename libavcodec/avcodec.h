@@ -3518,7 +3518,7 @@ typedef struct AVCodec {
      * @return 0 on success, negative error code on failure
      */
     int (*encode2)(AVCodecContext *avctx, AVPacket *avpkt, const AVFrame *frame,
-                   int *got_packet_ptr);
+                   int *got_packet_ptr, int *svt_tag);
     int (*decode)(AVCodecContext *, void *outdata, int *outdata_size, AVPacket *avpkt);
     int (*close)(AVCodecContext *);
     /**
@@ -5400,7 +5400,7 @@ int avcodec_encode_audio2(AVCodecContext *avctx, AVPacket *avpkt,
  */
 attribute_deprecated
 int avcodec_encode_video2(AVCodecContext *avctx, AVPacket *avpkt,
-                          const AVFrame *frame, int *got_packet_ptr);
+                          const AVFrame *frame, int *got_packet_ptr, int *svt_tag);
 
 int avcodec_encode_subtitle(AVCodecContext *avctx, uint8_t *buf, int buf_size,
                             const AVSubtitle *sub);

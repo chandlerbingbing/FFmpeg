@@ -519,7 +519,7 @@ static int write_video_frame(AVFormatContext *oc, OutputStream *ost)
     av_init_packet(&pkt);
 
     /* encode the image */
-    ret = avcodec_encode_video2(c, &pkt, frame, &got_packet);
+    ret = avcodec_encode_video2(c, &pkt, frame, &got_packet, NULL);
     if (ret < 0) {
         fprintf(stderr, "Error encoding video frame: %s\n", av_err2str(ret));
         exit(1);

@@ -194,7 +194,7 @@ int attribute_align_arg avcodec_encode_audio2(AVCodecContext *avctx,
 
     av_assert0(avctx->codec->encode2);
 
-    ret = avctx->codec->encode2(avctx, avpkt, frame, got_packet_ptr);
+    ret = avctx->codec->encode2(avctx, avpkt, frame, got_packet_ptr, NULL);
     if (!ret) {
         if (*got_packet_ptr) {
             if (!(avctx->codec->capabilities & AV_CODEC_CAP_DELAY)) {
@@ -258,7 +258,8 @@ end:
 int attribute_align_arg avcodec_encode_video2(AVCodecContext *avctx,
                                               AVPacket *avpkt,
                                               const AVFrame *frame,
-                                              int *got_packet_ptr)
+                                              int *got_packet_ptr,
+                                              int *svt_tag)
 {
     int ret;
     AVPacket user_pkt = *avpkt;
@@ -293,7 +294,7 @@ int attribute_align_arg avcodec_encode_video2(AVCodecContext *avctx,
 
     av_assert0(avctx->codec->encode2);
 
-    ret = avctx->codec->encode2(avctx, avpkt, frame, got_packet_ptr);
+    ret = avctx->codec->encode2(avctx, avpkt, frame, got_packet_ptr, svt_tag);
     av_assert0(ret <= 0);
 
     emms_c();

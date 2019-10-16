@@ -33,7 +33,7 @@
 #include "internal.h"
 #include "video.h"
 
-#define BUFFER_ALIGN 32
+#define BUFFER_ALIGN 4
 
 
 AVFrame *ff_null_get_video_buffer(AVFilterLink *link, int w, int h)
